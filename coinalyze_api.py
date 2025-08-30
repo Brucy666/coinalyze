@@ -11,8 +11,7 @@ HEADERS = {
     "Accept": "application/json",
     "User-Agent": "alphaops-coinalyze/1.0"
 }
-BASE = "https://api.coinalyze.net/api/v1"
-
+BASE = "https://api.coinalyze.net/v1"
 session = requests.Session()
 retries = Retry(total=5, backoff_factor=0.8,
                 status_forcelist=[429,500,502,503,504],
