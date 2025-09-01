@@ -1,28 +1,61 @@
 import os, json, requests
+from typing import Dict, Any, List
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+# Allow a comma-separated list of webhook URLs
+_WEBHOOKS = [w.strip() for w in os.getenv("WEBHOOK_URL", "").split(",") if w.strip()]
 
-def post_summary(text, embed=None):
-    """Post a compact message to Discord webhook if configured."""
-    if not WEBHOOK_URL:
+def post_summary(text: str, embed: Dict[str, Any] = None) -> bool:
+    """
+    Post a compact message (and optional embed) to all configured Discord webhooks.
+    Returns True if at least one succeeded.
+    """
+    if not _WEBHOOKS:
         return False
-    payload = {"content": text}
+
+    payload: Dict[str, Any] = {"content": text}
     if embed:
         payload["embeds"] = [embed]
-    r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
-    r.raise_for_status()
-    return True
 
-def build_embed(symbol, interval, pack):
-    oi = (pack.get("snapshots",{}).get("open_interest") or [{}])[0]
-    fr = (pack.get("snapshots",{}).get("funding_rate") or [{}])[0]
-    fields = []
-    if oi: fields.append({"name":"Open Interest", "value": str(oi.get("value","?")), "inline": True})
-    if fr: fields.append({"name":"Funding", "value": str(fr.get("value","?")), "inline": True})
-    fields.append({"name":"Candles", "value": str(len(pack.get("history",{}).get("ohlcv",[]))), "inline": True})
-    fields.append({"name":"LIQ", "value": str(len(pack.get("history",{}).get("liquidations",[]))), "inline": True})
-    return {
+    success = False
+    for url in _WEBHOOKS:
+        try:
+            r = requests.post(url, json=payload, timeout=10)
+            r.raise_for_status()
+            success = True
+        except Exception as e:
+            print(f"Discord post error ({url}):", repr(e))
+    return success
+
+def build_embed(symbol: str, interval: str, pack: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a Discord embed from a Coinalyze data pack.
+    Shows OI, Funding, Candles, Liquidations, LS ratio, and CVD if present.
+    """
+    snaps = pack.get("snapshots", {})
+    hist  = pack.get("history", {})
+
+    oi_val = snaps.get("oi_value")
+    fr_val = snaps.get("fr_value")
+
+    fields: List[Dict[str, Any]] = []
+    if oi_val is not None:
+        fields.append({"name": "Open Interest", "value": str(oi_val), "inline": True})
+    if fr_val is not None:
+        fields.append({"name": "Funding", "value": str(fr_val), "inline": True})
+
+    fields.append({"name": "Candles", "value": str(len(hist.get("ohlcv", []))), "inline": True})
+    fields.append({"name": "LIQ", "value": str(len(hist.get("liquidations", []))), "inline": True})
+    fields.append({"name": "LS",  "value": str(len(hist.get("long_short_ratio", []))), "inline": True})
+
+    cvd = hist.get("cvd", [])
+    if cvd:
+        cvd_last = cvd[-1].get("cvd", "?")
+        fields.append({"name": "CVD(last)", "value": str(cvd_last), "inline": True})
+
+    embed: Dict[str, Any] = {
         "title": f"Coinalyze • {symbol} • {interval}",
         "description": "Live snapshot",
-        "fields": fields
+        "color": 0x2ECC71 if fr_val and float(fr_val) > 0 else 0xE74C3C,  # green if positive funding
+        "fields": fields,
     }
+    return embed
