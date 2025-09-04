@@ -1,105 +1,82 @@
-import os, traceback, sys
-from pathlib import Path
-from datetime import datetime, timedelta, timezone
-
-from export_helpers import (
-    daterange_utc, unix, write_jsonl, load_state, save_state,
-    ensure_dir, jitter_sleep_ms, unwrap_history
-)
-
+# historical_export.py
+import os, time, json, random, signal
+from datetime import datetime, timedelta
 from coinalyze_api import (
-    get_ohlcv_history, get_open_interest_history, get_funding_rate_history,
-    get_predicted_funding_rate_history, get_long_short_ratio_history, get_liquidation_history
+    get_open_interest_history,
+    get_funding_rate_history,
+    get_predicted_funding_rate_history,
+    get_liquidation_history,
+    get_long_short_ratio_history,
+    get_ohlcv_history,
 )
+from data_sink import append_jsonl
 
-# ---------- ENV ----------
-SYMBOLS   = [s.strip() for s in os.getenv("SYMBOLS","BTCUSDT_PERP.A").split(",") if s.strip()]
-INTERVALS = [s.strip() for s in os.getenv("INTERVALS","1min").split(",") if s.strip()]
-START_DATE = os.getenv("START_DATE","2024-01-01")
-END_DATE   = os.getenv("END_DATE","")
-OUT_ROOT   = Path(os.getenv("OUT_ROOT","/data/lake"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES","8"))
-GLOBAL_DELAY_MS = int(os.getenv("SLEEP_BETWEEN_CALLS_MS","400"))
+SYMBOL     = os.getenv("SYMBOL", "BTCUSDT_PERP.A")
+INTERVAL   = os.getenv("INTERVAL", "1min")
+START_DATE = os.getenv("START_DATE", "2023-01-01")  # format: YYYY-MM-DD
+END_DATE   = os.getenv("END_DATE", datetime.utcnow().strftime("%Y-%m-%d"))
+SLEEP_SEC  = int(os.getenv("SLEEP_SECONDS", "1"))
 
-# ---- Per-endpoint pacing (override in Railway Variables as needed) ----
-EP_DELAY_MS = {
-    "ohlcv": int(os.getenv("DELAY_OHLCV_MS","600")),
-    "oi":    int(os.getenv("DELAY_OI_MS","700")),
-    "fr":    int(os.getenv("DELAY_FR_MS","2500")),
-    "pfr":   int(os.getenv("DELAY_PFR_MS","7000")),  # heaviest
-    "ls":    int(os.getenv("DELAY_LS_MS","2500")),
-    "liq":   int(os.getenv("DELAY_LIQ_MS","1200")),
-}
+shutdown = False
+def _sigterm(*_): 
+    global shutdown
+    shutdown = True
+signal.signal(signal.SIGINT, _sigterm); signal.signal(signal.SIGTERM, _sigterm)
 
-ENDPOINTS = {
-    "ohlcv": get_ohlcv_history,
-    "oi":    get_open_interest_history,
-    "fr":    get_funding_rate_history,
-    "pfr":   get_predicted_funding_rate_history,
-    "ls":    get_long_short_ratio_history,
-    "liq":   get_liquidation_history,
-}
+def daterange(start_date, end_date):
+    cur = start_date
+    while cur <= end_date:
+        yield cur
+        cur += timedelta(days=1)
 
-def export_day(symbol: str, interval: str, day: datetime, state: dict):
-    day_str = day.strftime("%Y-%m-%d")
-    day_dir = OUT_ROOT / symbol / interval / day_str
-    ensure_dir(day_dir)
+def fetch_day(symbol, interval, day_str):
+    # convert day_str → timestamps
+    dt = datetime.strptime(day_str, "%Y-%m-%d")
+    start_ts = int(dt.timestamp())
+    end_ts   = int((dt + timedelta(days=1)).timestamp())
 
-    # UTC 00:00 → 23:59:59
-    t0 = unix(day.replace(hour=0, minute=0, second=0, microsecond=0))
-    t1 = unix((day + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)) - 1
+    data = {}
+    errors = {}
 
-    for key, fn in ENDPOINTS.items():
-        out_path = day_dir / f"{key}.jsonl"
-        done_key = f"{day_str}:{key}"
-        if out_path.exists() or state.get(done_key) == "ok":
-            print(f"SKIP {symbol} {interval} {day_str} {key} (exists)")
-            continue
+    try:
+        data["oi"]   = get_open_interest_history(symbol, interval, start_ts, end_ts)
+        data["fr"]   = get_funding_rate_history(symbol, interval, start_ts, end_ts)
+        data["pfr"]  = get_predicted_funding_rate_history(symbol, interval, start_ts, end_ts)
+        data["liq"]  = get_liquidation_history(symbol, interval, start_ts, end_ts)
+        data["ls"]   = get_long_short_ratio_history(symbol, interval, start_ts, end_ts)
+        data["ohlcv"]= get_ohlcv_history(symbol, interval, start_ts, end_ts)
+    except Exception as e:
+        errors["fetch_error"] = str(e)
 
-        # Endpoint-specific pacing before request
-        jitter_sleep_ms(EP_DELAY_MS.get(key, GLOBAL_DELAY_MS))
-
-        tries = 0
-        while True:
-            tries += 1
-            try:
-                print(f"FETCH {symbol} {interval} {day_str} {key} (try {tries})")
-                resp = fn(symbol, interval, t0, t1)
-                rows = unwrap_history(resp)
-                write_jsonl(out_path, rows)
-                state[done_key] = "ok"
-                break
-            except Exception as e:
-                print(f"ERROR {symbol} {interval} {day_str} {key}: {repr(e)}")
-                if tries >= MAX_RETRIES:
-                    state[done_key] = f"error:{repr(e)}"
-                    break
-                # after errors add a longer pause
-                jitter_sleep_ms(max(EP_DELAY_MS.get(key, GLOBAL_DELAY_MS), 2000))
-
-        save_state(OUT_ROOT / "_state" / f"{symbol}_{interval}.json", state)
-        # small global gap
-        jitter_sleep_ms(GLOBAL_DELAY_MS)
+    return {"symbol": symbol, "interval": interval, "day": day_str,
+            "data": data, "errors": errors, "fetched_at": int(time.time())}
 
 def main():
-    ensure_dir(OUT_ROOT)
-    rng_end = END_DATE if END_DATE else None
-    for symbol in SYMBOLS:
-        for interval in INTERVALS:
-            state_path = OUT_ROOT / "_state" / f"{symbol}_{interval}.json"
-            state = load_state(state_path)
-            for day in daterange_utc(START_DATE, rng_end):
-                export_day(symbol, interval, day, state)
+    start_date = datetime.strptime(START_DATE, "%Y-%m-%d")
+    end_date   = datetime.strptime(END_DATE, "%Y-%m-%d")
+
+    print(f"=== Historical Export ===")
+    print(f"Symbol={SYMBOL} | Interval={INTERVAL} | From {START_DATE} to {END_DATE}")
+    print("Press Ctrl+C to stop\n")
+
+    total_days = (end_date - start_date).days + 1
+    counter = 0
+
+    for dt in daterange(start_date, end_date):
+        if shutdown: break
+        day_str = dt.strftime("%Y-%m-%d")
+        counter += 1
+
+        pack = fetch_day(SYMBOL, INTERVAL, day_str)
+        append_jsonl(SYMBOL, INTERVAL, pack)
+
+        # ✅ Throttled logging
+        if counter % 10 == 0 or counter == total_days:
+            print(f"[{counter}/{total_days}] {day_str} saved")
+
+        time.sleep(SLEEP_SEC + random.uniform(0, 0.3*SLEEP_SEC))
+
+    print("Export finished.")
 
 if __name__ == "__main__":
-    try:
-        print("=== AlphaOps • Coinalyze Historical Export ===")
-        print("Symbols:", SYMBOLS, "| Intervals:", INTERVALS)
-        print("Range:", START_DATE, "→", (END_DATE or "today"))
-        main()
-        print("DONE.")
-    except KeyboardInterrupt:
-        print("Interrupted")
-    except Exception:
-        traceback.print_exc()
-        sys.exit(1)
+    main()
