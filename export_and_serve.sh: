@@ -1,0 +1,22 @@
+#!/bin/bash
+set -e
+
+MONTH=2025-08
+SYM=BTCUSDT_PERP.A
+INT=1min
+OUT=/data/exports
+SRC=/data/lake/$SYM/$INT
+
+mkdir -p "$OUT"
+echo "Packing $SRC for $MONTH..."
+
+if [ -d "$SRC" ]; then
+  cd "$SRC"
+  tar -czf "$OUT/${SYM}_${INT}_${MONTH}_ALL.tgz" ./* || true
+  echo "Wrote $OUT/${SYM}_${INT}_${MONTH}_ALL.tgz"
+else
+  echo "WARNING: Source folder $SRC not found — skipping pack"
+fi
+
+cd "$OUT"
+exec python3 -m http.server 8000
