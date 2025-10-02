@@ -5,12 +5,13 @@ CoinAnalyzer API (flat logs, recursive scan)
 - Parses either valid JSON or flat 'TF/OI/FR/LS/CVD ...' lines
 - Derives symbol/interval from folder path when missing
 - One-symbol service by default (DEFAULT_SYMBOL)
+
 Routes:
   GET /healthz
   GET /v1/files?n=20
   GET /v1/metrics
   GET /v1/metrics/debug
-  GET /v1/metrics/all        --> latest 1m,5m,15m,1h in one call
+  GET /v1/metrics/all   -> latest 1m, 5m, 15m, 1h in one response
 """
 
 import os, time, json
@@ -30,7 +31,7 @@ DEFAULT_SYMBOL   = os.getenv("DEFAULT_SYMBOL", "BTCUSDT").upper()
 DEFAULT_INTERVAL = os.getenv("DEFAULT_INTERVAL", "1m").lower()
 
 # ---------------- APP ----------------
-app = FastAPI(title="CoinAnalyzer API (flat logs, recursive)", version="1.3.0")
+app = FastAPI(title="CoinAnalyzer API (flat logs, recursive)", version="1.3.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 _cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -83,7 +84,7 @@ def _norm_interval(raw: Any) -> str:
     if not raw: return DEFAULT_INTERVAL
     s = str(raw).lower().strip()
     m = {
-        "1":"1m","1m":"1m","1min":"1m",
+        "1":"1m","1m":"1m","1min":"1m","one_minute":"1m",
         "3":"3m","3m":"3m","3min":"3m",
         "5":"5m","5m":"5m","5min":"5m",
         "12":"12m","12m":"12m","12min":"12m",
@@ -97,7 +98,7 @@ def _norm_interval(raw: Any) -> str:
 def _parse_flat(txt: str) -> Dict[str, Any]:
     """
     Parse lines like:
-    [14:44:32] TF:1min OI:93306.038 FR:0.01 Candles:360 LIQ:127 LS:0 CVD:1100.92 ...
+      [14:44:32] TF:1min OI:93306.038 FR:0.01 Candles:360 LIQ:127 LS:0 CVD:1100.92 ...
     Accepts KEY:VAL and KEY=VAL tokens.
     """
     out: Dict[str, Any] = {}
@@ -120,13 +121,13 @@ def _parse_any(path: Path) -> Optional[Dict[str, Any]]:
     txt = _read_text(path)
     if not txt:
         return None
-    # If JSON object/array
+    # JSON object/array
     if txt[:1] in ("{","["):
         try:
             return json.loads(txt)
         except Exception:
             pass
-    # fallback: flat tokens
+    # flat tokens
     return _parse_flat(txt)
 
 # ---------------- EXTRACT ----------------
@@ -170,8 +171,19 @@ def _pick_latest() -> Dict[str, Any]:
     raise HTTPException(status_code=404, detail=f"No data found in {DATA_DIR}")
 
 def _pick_latest_for_tf(tf: str) -> Optional[Dict[str, Any]]:
-    # find newest file specifically under that tf folder (e.g., **/1m/**/*.json)
-    for p in _rscan_latest(DATA_DIR, f"**/{tf}/**/*.json", 200):
+    """
+    Grab the newest file under the interval folder.
+    Map normalized tf (1m,5m,15m,1h) to folder names (1min,5min,15min,1hour).
+    """
+    folder_map = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "1h": "1hour"
+    }
+    folder = folder_map.get(tf, tf)
+    pattern = f"**/{folder}/**/*.json"
+    for p in _rscan_latest(DATA_DIR, pattern, 200):
         obj = _parse_any(p)
         if isinstance(obj, dict) and obj:
             return _extract_core(obj, p)
@@ -180,7 +192,8 @@ def _pick_latest_for_tf(tf: str) -> Optional[Dict[str, Any]]:
 # ---------------- ROUTES ----------------
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok" if Path(DATA_DIR).exists() else "missing_data_dir", "dir": DATA_DIR, "glob": FILE_GLOB}
+    return {"status": "ok" if Path(DATA_DIR).exists() else "missing_data_dir",
+            "dir": DATA_DIR, "glob": FILE_GLOB}
 
 @app.get("/v1/files")
 def list_files(n: int = 20):
@@ -217,6 +230,5 @@ def metrics_all():
             out[tf] = snap
     if not out:
         raise HTTPException(status_code=404, detail=f"No data found for {tf_targets}")
-    # Symbol: prefer any derived from files; else default
     sym = next((v["symbol"] for v in out.values() if "symbol" in v), DEFAULT_SYMBOL)
     return JSONResponse({"symbol": sym, "latest": out})
