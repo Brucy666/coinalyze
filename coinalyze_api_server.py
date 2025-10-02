@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 CoinAnalyzer API (flat logs, recursive scan)
-- Recursively scans DATA_DIR (e.g., /data/BTCUSDT_PERP_A/1min/20251002/*.json)
+- Recursively scans DATA_DIR for timestamp-named .json files (FILE_GLOB, default **/*.json)
 - Parses either valid JSON or flat 'TF/OI/FR/LS/CVD ...' lines
-- Derives symbol/interval from path segments when missing
-- One-symbol service (DEFAULT_SYMBOL) for safety
-
+- Derives symbol/interval from folder path when missing
+- One-symbol service by default (DEFAULT_SYMBOL)
 Routes:
   GET /healthz
   GET /v1/files?n=20
   GET /v1/metrics
   GET /v1/metrics/debug
+  GET /v1/metrics/all        --> latest 1m,5m,15m,1h in one call
 """
 
 import os, time, json
@@ -23,14 +23,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------- ENV ----------------
 DATA_DIR         = os.getenv("DATA_DIR", "/data")
-FILE_GLOB        = os.getenv("FILE_GLOB", "**/*.json")  # recursive
+FILE_GLOB        = os.getenv("FILE_GLOB", "**/*.json")  # recursive by default
 SCAN_LIMIT       = int(os.getenv("SCAN_LIMIT", "1000"))
 CACHE_TTL        = int(os.getenv("CACHE_TTL_SEC", "5"))
 DEFAULT_SYMBOL   = os.getenv("DEFAULT_SYMBOL", "BTCUSDT").upper()
 DEFAULT_INTERVAL = os.getenv("DEFAULT_INTERVAL", "1m").lower()
 
 # ---------------- APP ----------------
-app = FastAPI(title="CoinAnalyzer API (flat logs, recursive)", version="1.2.0")
+app = FastAPI(title="CoinAnalyzer API (flat logs, recursive)", version="1.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 _cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -131,20 +131,23 @@ def _parse_any(path: Path) -> Optional[Dict[str, Any]]:
 
 # ---------------- EXTRACT ----------------
 def _extract_core(obj: Dict[str, Any], path: Path) -> Dict[str, Any]:
-    # interval: prefer content, else from path
-    interval = _norm_interval(obj.get("interval") or obj.get("tf") or obj.get("TF") or _norm_interval_from_path(path) or DEFAULT_INTERVAL)
-    # metrics (allow both lower and UPPER)
+    # interval: prefer content, else from path, else default
+    interval = _norm_interval(
+        obj.get("interval") or obj.get("tf") or obj.get("TF") or _norm_interval_from_path(path) or DEFAULT_INTERVAL
+    )
+
+    # metrics (allow both lower and UPPER and flat)
     oi  = float(obj.get("oi_delta") or obj.get("oi") or obj.get("OI") or 0.0)
     fr  = float(obj.get("funding")  or obj.get("funding_rate") or obj.get("FR") or 0.0)
     ls  = float(obj.get("net_long_short") or obj.get("nl_ns") or obj.get("LS") or 1.0)
-    # divergence: explicit or derive from raw CVD sign
+
     cvd_div = obj.get("cvd_divergence") or obj.get("cvd_div")
     if not cvd_div:
         cvd_val = float(obj.get("cvd") or obj.get("CVD") or 0.0)
         cvd_div = "bullish" if cvd_val > 0 else ("bearish" if cvd_val < 0 else "none")
     else:
         cvd_div = str(cvd_div).lower()
-    # symbol: prefer from path; fallback env
+
     sym = _norm_symbol_from_path(path) or DEFAULT_SYMBOL
 
     return {
@@ -165,6 +168,14 @@ def _pick_latest() -> Dict[str, Any]:
         if isinstance(obj, dict) and obj:
             return _extract_core(obj, p)
     raise HTTPException(status_code=404, detail=f"No data found in {DATA_DIR}")
+
+def _pick_latest_for_tf(tf: str) -> Optional[Dict[str, Any]]:
+    # find newest file specifically under that tf folder (e.g., **/1m/**/*.json)
+    for p in _rscan_latest(DATA_DIR, f"**/{tf}/**/*.json", 200):
+        obj = _parse_any(p)
+        if isinstance(obj, dict) and obj:
+            return _extract_core(obj, p)
+    return None
 
 # ---------------- ROUTES ----------------
 @app.get("/healthz")
@@ -192,3 +203,20 @@ def metrics_debug():
         return JSONResponse(core)
     except HTTPException as e:
         return JSONResponse({"detail": e.detail, "dir": DATA_DIR, "glob": FILE_GLOB}, status_code=e.status_code)
+
+@app.get("/v1/metrics/all")
+def metrics_all():
+    """
+    Return the freshest snapshot for each key interval: 1m, 5m, 15m, 1h.
+    """
+    tf_targets = ["1m", "5m", "15m", "1h"]
+    out: Dict[str, Any] = {}
+    for tf in tf_targets:
+        snap = _pick_latest_for_tf(tf)
+        if snap:
+            out[tf] = snap
+    if not out:
+        raise HTTPException(status_code=404, detail=f"No data found for {tf_targets}")
+    # Symbol: prefer any derived from files; else default
+    sym = next((v["symbol"] for v in out.values() if "symbol" in v), DEFAULT_SYMBOL)
+    return JSONResponse({"symbol": sym, "latest": out})
