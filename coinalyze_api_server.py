@@ -1,355 +1,343 @@
 # coinalyze_api_server.py
 """
-CoinAnalyzer read-only HTTP service (FastAPI)
+CoinAnalyzer API server (rewritten extractor)
 
 Features:
-- Recursively scans DATA_DIR for JSON / text files matching a pattern
-- Parses JSON or flat-line files (both supported)
-- Picks latest *valid* file per timeframe (skips files that don't have essential tokens)
-- Exposes /v1/metrics, /v1/metrics/all, /v1/metrics/debug, /v1/files, /healthz
-- Caches responses briefly to reduce disk IO
+- Scans JSON snapshot files under DATA_DIR using FILE_GLOB.
+- Extracts nested values: OPEN_INTEREST, FUNDING_RATE, NET_LONG_SHORT, LIQUIDATIONS, TRADES/HISTORY.
+- Returns compact "core" metrics via FastAPI endpoints:
+    GET /v1/metrics/all
+    GET /v1/metrics/{symbol}
 """
 
 import os
 import time
-import glob
 import json
+import glob
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Any, Dict, Generator, Iterable, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-# ---------------- ENV ----------------
-DATA_DIR = os.getenv("DATA_DIR", "/data")  # changed default to /data (volume mount)
-FILE_GLOB = os.getenv("FILE_GLOB", "**/*.json")  # recursive by default
-SCAN_LIMIT = int(os.getenv("SCAN_LIMIT", "500"))
-CACHE_TTL = int(os.getenv("CACHE_TTL_SEC", "5"))
-DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "BTCUSDT").upper()
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# ----------------------------
+# Config (environment friendly)
+# ----------------------------
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+FILE_GLOB = os.environ.get("FILE_GLOB", "**/*.json")
+SCAN_LIMIT = int(os.environ.get("SCAN_LIMIT", "1000"))  # how many files to scan at most when searching latest
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
+# Logging
+logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO"))
 log = logging.getLogger("coinalyze_api")
 
-# ---------------- APP ----------------
-app = FastAPI(title="CoinAnalyzer API (robust)", version="1.1")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
+# FastAPI
+app = FastAPI(title="CoinAnalyzer API", version="0.1")
 
-# simple TTL cache: key -> (expire_ts, payload)
-_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-
-
-def _cache_get(k: str) -> Optional[Dict[str, Any]]:
-    hit = _cache.get(k)
-    if not hit:
-        return None
-    exp, payload = hit
-    if time.time() > exp:
-        _cache.pop(k, None)
-        return None
-    return payload
+# ----------------------------
+# Utility functions
+# ----------------------------
 
 
-def _cache_set(k: str, payload: Dict[str, Any], ttl: int = CACHE_TTL):
-    _cache[k] = (time.time() + ttl, payload)
-
-
-# ---------------- Helpers: scanning & parsing ----------------
-def _scan_latest(data_dir: str, pattern: str, limit: int = SCAN_LIMIT) -> List[Path]:
+def _rscan_latest(base_dir: str, pattern: str, limit: int = 1000) -> Generator[Path, None, None]:
     """
-    Glob recursively and return up to `limit` files sorted by mtime desc.
-    Pattern supports recursive glob like '**/*.json'
+    Yield file Paths matching pattern sorted by mtime (descending / newest first).
+    pattern is a glob pattern relative to base_dir (eg. '**/*.json').
     """
-    pat = str(Path(data_dir) / pattern)
-    # glob.glob with recursive=True for '**' patterns
-    files = glob.glob(pat, recursive=True)
-    files = sorted(files, key=lambda p: Path(p).stat().st_mtime if Path(p).exists() else 0, reverse=True)
-    paths = [Path(p) for p in files[:max(1, limit)]]
-    log.debug("scanned %d files (limit=%d) using pattern %s", len(paths), limit, pattern)
-    return paths
+    p = Path(base_dir)
+    if not p.exists():
+        log.warning("DATA_DIR does not exist: %s", base_dir)
+        return
 
-
-def _parse_flat_line(txt: str) -> Dict[str, Any]:
-    """
-    Parse a line like:
-    [14:44:32] TF:1min OI:93306.038 FR:0.01 Candles:360 LIQ:127 LS:0 CVD:1100.92
-
-    Return mapping of UPPER keys to numeric/string values.
-    """
-    out: Dict[str, Any] = {}
-    if not txt:
-        return out
-    # remove common wrapping and split tokens
-    txt = txt.strip()
-    # sometimes file might contain multiple lines; just parse the first non-empty line
-    for line in txt.splitlines():
-        if line.strip():
-            txt = line.strip()
+    # Use glob to produce list, then sort by mtime
+    full_pattern = str(p / pattern)
+    files = glob.glob(full_pattern, recursive=True)
+    files_sorted = sorted(files, key=lambda x: Path(x).stat().st_mtime, reverse=True)
+    for i, f in enumerate(files_sorted):
+        if i >= limit:
             break
-
-    # remove brackets timestamps
-    txt = txt.replace("[", "").replace("]", "")
-    tokens = txt.split()
-    for token in tokens:
-        if ":" not in token:
-            continue
-        k, v = token.split(":", 1)
-        k = k.strip().upper()
-        v = v.strip()
-        # attempt numeric conversion
-        try:
-            # integers first
-            if v.isdigit():
-                out[k] = int(v)
-            else:
-                out[k] = float(v)
-        except Exception:
-            out[k] = v
-    return out
+        yield Path(f)
 
 
-def _parse_any_file(path: Path) -> Optional[Dict[str, Any]]:
-    """
-    Try to parse file as JSON first; if not JSON try to parse as flat-line text.
-    Returns parsed mapping or None if parsing failed / empty.
-    """
+def _safe_load_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            txt = f.read().strip()
-        if not txt:
-            return None
-        # try JSON
-        try:
-            obj = json.loads(txt)
-            if isinstance(obj, dict):
-                # normalize keys to upper for token parsing convenience
-                return {k.upper(): v for k, v in obj.items()}
-            # if JSON isn't a dict, fall back to flat parse of first line
-        except Exception:
-            pass
-        # fallback to flat parser
-        parsed = _parse_flat_line(txt)
-        return parsed if parsed else None
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
     except Exception as e:
-        log.debug("failed to parse file %s: %s", path, e)
+        log.exception("Failed to load json %s: %s", path, e)
         return None
 
 
-# normalize TF tokens: input like "1min", "1m", "1", "60", "1hour" -> "1m", "5m", "15m", "1h"
-def _normalize_interval(tf_raw: str) -> str:
-    if tf_raw is None:
-        return "unknown"
-    s = str(tf_raw).lower().strip()
-    # common normalizations
-    s = s.replace("min", "m").replace("mins", "m")
-    s = s.replace("hour", "h").replace("hrs", "h")
-    # handle cases like '1mim' or '1min'
-    s = s.replace("1mim", "1m").replace("60", "1h")
-    # make canonical: 1m, 5m, 15m, 1h
-    if s in ("1m", "1", "60s"):
-        return "1m"
-    if s in ("5m",):
-        return "5m"
-    if s in ("15m",):
-        return "15m"
-    if s in ("1h", "60"):
-        return "1h"
-    return s
+def _coalesce_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return float(default)
+        return float(v)
+    except Exception:
+        return default
+
+
+# ----------------------------
+# Extraction logic (core)
+# ----------------------------
+
+
+def _normalize_interval(interval_raw: str) -> str:
+    """
+    Normalise interval token. Accept some variants.
+    """
+    if not interval_raw:
+        return ""
+    t = str(interval_raw).lower()
+    # handle common forms
+    mapping = {
+        "1min": "1m",
+        "1m": "1m",
+        "5min": "5m",
+        "5m": "5m",
+        "15min": "15m",
+        "15m": "15m",
+        "1hour": "1h",
+        "1h": "1h",
+    }
+    for k, v in mapping.items():
+        if t.startswith(k):
+            return v
+    return t
 
 
 def _extract_core(parsed: Dict[str, Any], src_path: Optional[Path] = None) -> Dict[str, Any]:
     """
-    Build the compact response schema from parsed tokens.
-    Expects parsed keys upper-cased when appropriate.
+    Extract a compact core dictionary from a raw snapshot parsed JSON.
+    Pull nested data (OPEN_INTEREST, FUNDING_RATE, LIQUIDATIONS, NET_LONG_SHORT, HISTORY, TRADES).
     """
-    # support both TB: TF or TF token or 'interval' etc.
-    interval = parsed.get("TF") or parsed.get("TF:") or parsed.get("INTERVAL") or parsed.get("T")
-    interval = _normalize_interval(interval)
+    # get top-level fields safely
+    symbol = parsed.get("SYMBOL") or parsed.get("symbol") or parsed.get("symbol_name")
+    interval_raw = parsed.get("INTERVAL") or parsed.get("interval") or parsed.get("tf") or ""
+    interval = _normalize_interval(interval_raw)
+    ts = parsed.get("ts") or parsed.get("TS") or parsed.get("timestamp") or parsed.get("time")
+    try:
+        ts = int(ts) if ts is not None else int(time.time())
+    except Exception:
+        ts = int(time.time())
 
-    def _get_float(keys, default=0.0):
-        for k in keys:
-            if k in parsed:
-                try:
-                    return float(parsed[k])
-                except Exception:
-                    try:
-                        return float(str(parsed[k]).replace(",", ""))
-                    except Exception:
-                        return default
-        return default
+    # OPEN_INTEREST
+    oi_val = None
+    oi = parsed.get("OPEN_INTEREST") or parsed.get("open_interest") or {}
+    if isinstance(oi, dict):
+        # possible shapes: {"value": 12345.6, ...} or nested lists
+        oi_val = oi.get("value") or oi.get("oi") or oi.get("oi_value")
+    if oi_val is None:
+        # attempt to find `open_interest` inside arrays
+        try:
+            # some snapshots contain lists of objects in the "open_interest" key
+            if isinstance(oi, list) and len(oi) and isinstance(oi[0], dict):
+                oi_val = oi[0].get("value") or oi[0].get("oi")
+        except Exception:
+            oi_val = None
+    oi_delta = _coalesce_float(oi_val, 0.0)
 
-    oi = _get_float(["OI", "OI_DELTA", "OI_DELTA:"])
-    fr = _get_float(["FR", "FUNDING", "FUND"])
-    cvd = _get_float(["CVD", "CVD_DELTA", "CVD:"])
-    ls = _get_float(["LS", "NL_NS", "NL/NS", "NET_LONG_SHORT"])
+    # FUNDING_RATE
+    fr_val = None
+    fr = parsed.get("FUNDING_RATE") or parsed.get("funding_rate") or {}
+    if isinstance(fr, dict):
+        fr_val = fr.get("fr_value") or fr.get("value") or fr.get("funding")
+    fr_val = _coalesce_float(fr_val, 0.0)
 
-    cvd_div = "bullish" if cvd > 0 else ("bearish" if cvd < 0 else "none")
+    # NET_LONG_SHORT
+    nls_val = None
+    nls = parsed.get("NET_LONG_SHORT") or parsed.get("net_long_short")
+    if nls is None:
+        # sometimes stored as list of [ [ts, value], ... ]
+        nl = parsed.get("NET_LONG_SHORT_HISTORY") or parsed.get("net_long_short_history")
+        if isinstance(nl, list) and nl:
+            last = nl[-1]
+            # either pair [ts, val] or dict
+            if isinstance(last, (list, tuple)) and len(last) >= 2:
+                nls_val = last[1]
+            elif isinstance(last, dict):
+                nls_val = last.get("value") or last.get("v")
+    else:
+        nls_val = nls
+    nls_val = _coalesce_float(nls_val, 1.0)
 
+    # LIQUIDATIONS
+    liq_long_total = 0.0
+    liq_short_total = 0.0
+    liqs = parsed.get("LIQUIDATIONS") or parsed.get("liquidations") or []
+    # liqs often looks like: [{"t":ts,"b":123.4,"s":45.6}, ...] where b=buy (long), s=sell (short) OR vice versa
+    if isinstance(liqs, list):
+        for item in liqs:
+            if not isinstance(item, dict):
+                continue
+            # common keys: "b", "s" or "buy", "sell", "long", "short"
+            b = item.get("b") or item.get("buy") or item.get("long") or 0.0
+            s = item.get("s") or item.get("sell") or item.get("short") or 0.0
+            try:
+                liq_long_total += float(b or 0.0)
+                liq_short_total += float(s or 0.0)
+            except Exception:
+                continue
+
+    # Try to extract CVD/trades deltas from trades or history (if present)
+    cvd_delta = None
+    cvd_history = parsed.get("TRADES") or parsed.get("trades") or parsed.get("HISTORY") or parsed.get("history")
+    if isinstance(cvd_history, list) and cvd_history:
+        # Search last few entries for 'cvd' or 'delta' keys and sum or take last.
+        # This is heuristic: prefer 'cvd' in last element; fallback to summing 'delta' entries.
+        last = cvd_history[-1]
+        if isinstance(last, dict):
+            cvd_delta = last.get("cvd") or last.get("CVD") or last.get("cumulative_delta")
+        # fallback: sum 'delta' from a small selection
+        if cvd_delta is None:
+            try:
+                s = 0.0
+                for it in cvd_history[-200:]:
+                    if isinstance(it, dict) and "delta" in it:
+                        s += float(it.get("delta", 0.0) or 0.0)
+                cvd_delta = s
+            except Exception:
+                cvd_delta = None
+
+    # Determine simple cvd_divergence (heuristic)
+    cvd_div = "none"
+    if (liq_long_total or liq_short_total):
+        if liq_short_total > liq_long_total * 1.05:
+            cvd_div = "bullish"  # more short liquidations -> push price up
+        elif liq_long_total > liq_short_total * 1.05:
+            cvd_div = "bearish"
+
+    # Also capture basic OHLC last value if available
+    ohlcv_snapshot = parsed.get("HISTORY") or parsed.get("history") or parsed.get("ohlc") or parsed.get("OHLC")
+    last_price = None
+    if isinstance(ohlcv_snapshot, list) and ohlcv_snapshot:
+        last = ohlcv_snapshot[-1]
+        if isinstance(last, dict):
+            last_price = last.get("c") or last.get("close")
+    # Build core dict
     core = {
-        "symbol": parsed.get("SYMBOL", parsed.get("symbol", DEFAULT_SYMBOL)).upper() if parsed.get("SYMBOL", None) else DEFAULT_SYMBOL,
+        "symbol": symbol,
         "interval": interval,
-        "ts": int(time.time()),
-        "oi_delta": oi,
+        "ts": int(ts),
+        "oi_delta": _coalesce_float(oi_delta, 0.0),
+        "funding": _coalesce_float(fr_val, 0.0),
+        "net_long_short": _coalesce_float(nls_val, 1.0),
+        "liq_long": float(liq_long_total),
+        "liq_short": float(liq_short_total),
+        "cvd_delta": _coalesce_float(cvd_delta, 0.0) if cvd_delta is not None else None,
         "cvd_divergence": cvd_div,
-        "net_long_short": ls,
-        "funding": fr,
-        "ohlcv": None,
-        "_raw": parsed,
+        "last_price": _coalesce_float(last_price, None) if last_price is not None else None,
+        "_file": str(src_path) if src_path is not None else None,
     }
-    if src_path:
-        core["_file"] = str(src_path)
     return core
 
 
-# ---------------- File selection logic ----------------
-def _pick_latest_for_tf(tf: str, data_dir: str = DATA_DIR, pattern: str = FILE_GLOB, scan_limit: int = SCAN_LIMIT) -> Dict[str, Any]:
-    """
-    Find the most recent file under the interval folder that contains valid fields.
-    Mapping between normalized tf and expected folder name is supported.
-    This function backtracks through recent files until it finds a file with OI/FR/LS.
-    """
-    # map normalized requests to common folder names in your storage (adjust as needed)
-    folder_map = {
-        "1m": "1min",
-        "5m": "5min",
-        "15m": "15min",
-        "1h": "1hour",
-    }
-    tf_norm = _normalize_interval(tf)
-    folder = folder_map.get(tf_norm, tf_norm)
+# ----------------------------
+# High-level scan helpers
+# ----------------------------
 
-    # pattern to search inside DATA_DIR
-    # we try [**/<folder>/**/*.json] because your files are organised like /data/<SYMBOL>/<tf>/<timestamp>.json
-    search_pattern = f"**/{folder}/**/*.json"
-    log.debug("pick_latest_for_tf: searching for tf=%s using pattern=%s", tf_norm, search_pattern)
 
-    for p in _scan_latest(data_dir, search_pattern, scan_limit):
-        parsed = _parse_any_file(p)
+def pick_latest_for_intervals(symbol_filter: Optional[str] = None, intervals: Optional[Iterable[str]] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Return latest core for each interval for given symbol_filter.
+    Returns mapping interval -> core dict
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    intervals = set(intervals or ["1m", "5m", "15m", "1h"])
+    # Scan newest files first
+    for path in _rscan_latest(DATA_DIR, FILE_GLOB, limit=SCAN_LIMIT):
+        parsed = _safe_load_json(path)
         if not parsed:
             continue
-        # quick validity check: must contain at least one of OI / FR / LS or have 'CVD' and 'OI' etc.
-        has_oi = any(k in parsed for k in ("OI", "OI_DELTA", "OI_DELTA:"))
-        has_fr = any(k in parsed for k in ("FR", "FUND", "FUNDING"))
-        has_ls = any(k in parsed for k in ("LS", "NL_NS", "NET_LONG_SHORT", "NL/NS"))
-
-        # If file lacks the richer tokens, skip it — we want "complete" metric rows for CA bias
-        if not (has_oi or has_fr or has_ls):
-            # keep looking further back
-            log.debug("skipping incomplete file %s (no OI/FR/LS)", p)
+        core = _extract_core(parsed, path)
+        if not core.get("symbol"):
             continue
-
-        # At least one critical metric present -> accept this file
-        core = _extract_core(parsed, p)
-        core["_picked_from"] = str(p)
-        return core
-
-    # if nothing found, raise 404
-    raise HTTPException(status_code=404, detail=f"No valid data found for timeframe '{tf}' in {data_dir}")
-
-
-def _pick_latest_any(data_dir: str = DATA_DIR, pattern: str = FILE_GLOB, scan_limit: int = SCAN_LIMIT) -> Dict[str, Any]:
-    """
-    Fallback pick latest file regardless of timeframe by scanning the top-most files.
-    This returns a single core dict or raises.
-    """
-    for p in _scan_latest(data_dir, pattern, scan_limit):
-        parsed = _parse_any_file(p)
-        if parsed:
-            core = _extract_core(parsed, p)
-            core["_picked_from"] = str(p)
-            return core
-    raise HTTPException(status_code=404, detail=f"No data found in {data_dir}")
+        if symbol_filter and str(core["symbol"]).lower() != str(symbol_filter).lower():
+            continue
+        interval = core.get("interval") or ""
+        if interval in intervals and interval not in result:
+            result[interval] = core
+            # if found all intervals, break early
+            if set(result.keys()) >= intervals:
+                break
+    return result
 
 
-# ---------------- Routes ----------------
-@app.get("/healthz")
-def healthz():
-    ok = Path(DATA_DIR).exists()
-    return {"status": "ok" if ok else "missing_data_dir", "dir": DATA_DIR, "glob": FILE_GLOB}
+# ----------------------------
+# API models (optional)
+# ----------------------------
 
 
-@app.get("/v1/files")
-def list_files(limit: int = Query(50, ge=1, le=1000)):
-    """
-    Return a short listing of recent files (for debugging).
-    """
-    key = f"files:{limit}"
-    hit = _cache_get(key)
-    if hit:
-        return JSONResponse(hit)
-    files = [str(p) for p in _scan_latest(DATA_DIR, FILE_GLOB, limit)]
-    payload = {"dir": DATA_DIR, "glob": FILE_GLOB, "count": len(files), "files": files}
-    _cache_set(key, payload)
-    return JSONResponse(payload)
+class MetricsAllResponse(BaseModel):
+    ok: bool
+    latest: Dict[str, Dict[str, Any]]
 
 
-@app.get("/v1/metrics")
-def metrics(tf: Optional[str] = Query(None, description="Optional timeframe: e.g. 1m,5m,15m,1h")):
-    """
-    Return the latest best datapoint. If tf provided, try to pick latest valid for that timeframe.
-    """
-    key = f"latest:{tf or 'any'}"
-    hit = _cache_get(key)
-    if hit:
-        return JSONResponse(hit)
-    try:
-        if tf:
-            core = _pick_latest_for_tf(tf, DATA_DIR, FILE_GLOB, SCAN_LIMIT)
-        else:
-            core = _pick_latest_any(DATA_DIR, FILE_GLOB, SCAN_LIMIT)
-        _cache_set(key, core)
-        return JSONResponse(core)
-    except HTTPException as e:
-        raise e
+# ----------------------------
+# Endpoints
+# ----------------------------
 
 
-@app.get("/v1/metrics/all")
+@app.get("/v1/metrics/all", response_model=MetricsAllResponse)
 def metrics_all():
     """
-    Return latest valid entries for a set of TFs (1m,5m,15m,1h)
+    Return latest cores for all symbols / intervals found (limited).
+    Structure:
+      { "ok": True, "latest": { "BTCUSDT": { "1m": {...}, "5m": {...} }, "ETHUSDT": {...} } }
+    Implementation: scan files newest first and pick the first hit per symbol/interval.
     """
-    key = "metrics:all"
-    hit = _cache_get(key)
-    if hit:
-        return JSONResponse(hit)
+    # We'll build map: symbol -> interval -> core
+    latest_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    max_symbols = 200
+    scanned = 0
 
-    tfs = ["1m", "5m", "15m", "1h"]
-    out = {"symbol": DEFAULT_SYMBOL, "latest": {}, "missing": []}
-    for tf in tfs:
-        try:
-            core = _pick_latest_for_tf(tf, DATA_DIR, FILE_GLOB, SCAN_LIMIT)
-            out["latest"][tf] = core
-        except HTTPException as e:
-            out["missing"].append(tf)
-            log.debug("no data for tf %s: %s", tf, e.detail)
+    for path in _rscan_latest(DATA_DIR, FILE_GLOB, limit=SCAN_LIMIT):
+        parsed = _safe_load_json(path)
+        if not parsed:
             continue
+        core = _extract_core(parsed, path)
+        symbol = core.get("symbol")
+        interval = core.get("interval")
+        if not symbol or not interval:
+            continue
+        if symbol not in latest_map:
+            latest_map[symbol] = {}
+        if interval not in latest_map[symbol]:
+            latest_map[symbol][interval] = core
+        # avoid scanning forever; stop if we've collected enough symbols
+        scanned += 1
+        if len(latest_map) >= max_symbols:
+            break
+        # small safety break to keep response prompt
+        if scanned >= SCAN_LIMIT:
+            break
 
-    _cache_set(key, out)
-    return JSONResponse(out)
+    return {"ok": True, "latest": latest_map}
 
 
-@app.get("/v1/metrics/debug")
-def metrics_debug(tf: Optional[str] = Query(None)):
+@app.get("/v1/metrics/{symbol}", response_model=MetricsAllResponse)
+def metrics_for_symbol(symbol: str):
     """
-    Debug endpoint that returns parsing and file selection info, for troubleshooting.
+    Return the latest cores for requested symbol across the main intervals.
     """
-    try:
-        if tf:
-            # show the file we picked and the raw parsed content (not cached)
-            core = _pick_latest_for_tf(tf, DATA_DIR, FILE_GLOB, SCAN_LIMIT)
-            return JSONResponse({"ok": True, "picked": core})
-        else:
-            core = _pick_latest_any(DATA_DIR, FILE_GLOB, SCAN_LIMIT)
-            return JSONResponse({"ok": True, "picked": core})
-    except HTTPException as e:
-        return JSONResponse({"detail": e.detail, "dir": DATA_DIR}, status_code=e.status_code)
+    intervals = ["1m", "5m", "15m", "1h"]
+    picked = pick_latest_for_intervals(symbol_filter=symbol, intervals=intervals)
+    if not picked:
+        raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
+    return {"ok": True, "latest": picked}
 
 
-# ---------------- Startup note ----------------
-log.info("CoinAnalyzer API server starting up. DATA_DIR=%s FILE_GLOB=%s SCAN_LIMIT=%d", DATA_DIR, FILE_GLOB, SCAN_LIMIT)
+@app.get("/")
+def root():
+    return {"status": "ok", "dir": DATA_DIR, "glob": FILE_GLOB}
+
+
+# ----------------------------
+# Run with uvicorn if executed directly
+# ----------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    log.info("Starting CoinAnalyzer API server. DATA_DIR=%s FILE_GLOB=%s SCAN_LIMIT=%s", DATA_DIR, FILE_GLOB, SCAN_LIMIT)
+    uvicorn.run("coinalyze_api_server:app", host="0.0.0.0", port=8080, log_level="info", reload=False)
