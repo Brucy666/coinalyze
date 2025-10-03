@@ -1,343 +1,273 @@
 # coinalyze_api_server.py
-"""
-CoinAnalyzer API server (rewritten extractor)
-
-Features:
-- Scans JSON snapshot files under DATA_DIR using FILE_GLOB.
-- Extracts nested values: OPEN_INTEREST, FUNDING_RATE, NET_LONG_SHORT, LIQUIDATIONS, TRADES/HISTORY.
-- Returns compact "core" metrics via FastAPI endpoints:
-    GET /v1/metrics/all
-    GET /v1/metrics/{symbol}
-"""
-
-import os
-import time
-import json
-import glob
-import logging
+# Read-only FastAPI for CoinAnalyzer snapshots (robust nested extractor)
+import os, time, json, glob, logging
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-# ----------------------------
-# Config (environment friendly)
-# ----------------------------
-DATA_DIR = os.environ.get("DATA_DIR", "/data")
-FILE_GLOB = os.environ.get("FILE_GLOB", "**/*.json")
-SCAN_LIMIT = int(os.environ.get("SCAN_LIMIT", "1000"))  # how many files to scan at most when searching latest
+# ---------------- ENV ----------------
+DATA_DIR      = os.getenv("DATA_DIR", "/data")
+FILE_GLOB     = os.getenv("FILE_GLOB", "**/*.json")   # recursive
+SCAN_LIMIT    = int(os.getenv("SCAN_LIMIT", "1000"))
+CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "5"))
+LOGLEVEL      = os.getenv("LOGLEVEL", "INFO").upper()
 
-# Logging
-logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO"))
+logging.basicConfig(level=getattr(logging, LOGLEVEL, logging.INFO),
+                    format="%(asctime)s %(levelname)s [coinalyze_api] %(message)s")
 log = logging.getLogger("coinalyze_api")
 
-# FastAPI
-app = FastAPI(title="CoinAnalyzer API", version="0.1")
+# ---------------- APP ----------------
+app = FastAPI(title="CoinAnalyzer API", version="1.2")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
-# ----------------------------
-# Utility functions
-# ----------------------------
+_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
+def _cache_get(k: str) -> Optional[Dict[str, Any]]:
+    ent = _cache.get(k)
+    if not ent: return None
+    exp, payload = ent
+    if time.time() > exp:
+        _cache.pop(k, None)
+        return None
+    return payload
 
-def _rscan_latest(base_dir: str, pattern: str, limit: int = 1000) -> Generator[Path, None, None]:
-    """
-    Yield file Paths matching pattern sorted by mtime (descending / newest first).
-    pattern is a glob pattern relative to base_dir (eg. '**/*.json').
-    """
-    p = Path(base_dir)
-    if not p.exists():
-        log.warning("DATA_DIR does not exist: %s", base_dir)
-        return
+def _cache_set(k: str, payload: Dict[str, Any], ttl: int = CACHE_TTL_SEC):
+    _cache[k] = (time.time() + ttl, payload)
 
-    # Use glob to produce list, then sort by mtime
-    full_pattern = str(p / pattern)
-    files = glob.glob(full_pattern, recursive=True)
-    files_sorted = sorted(files, key=lambda x: Path(x).stat().st_mtime, reverse=True)
-    for i, f in enumerate(files_sorted):
-        if i >= limit:
-            break
-        yield Path(f)
+# ---------------- Utils ----------------
+def _rscan_latest(base: str, pattern: str, limit: int) -> List[Path]:
+    basep = Path(base)
+    if not basep.exists():
+        log.warning("DATA_DIR does not exist: %s", base)
+        return []
+    paths = glob.glob(str(basep / pattern), recursive=True)
+    paths.sort(key=lambda p: Path(p).stat().st_mtime if Path(p).exists() else 0, reverse=True)
+    return [Path(p) for p in paths[:max(1, limit)]]
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        try:
+            return float(str(v).replace(",", ""))
+        except Exception:
+            return default
 
-def _safe_load_json(path: Path) -> Optional[Dict[str, Any]]:
+def _normalize_symbol(sym: Optional[str]) -> str:
+    if not sym: return ""
+    s = str(sym).upper()
+    if s.endswith("_PERP_A"):
+        s = s.replace("_PERP_A", "")
+    return s
+
+def _normalize_interval(tf_raw: Any) -> str:
+    s = (str(tf_raw) if tf_raw is not None else "").lower()
+    s = s.replace("mins", "m").replace("min", "m").replace("hour", "h")
+    mapping = {"1m":"1m","1":"1m","5m":"5m","15m":"15m","1h":"1h","60":"1h","60m":"1h"}
+    return mapping.get(s, s)
+
+def _load_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
         with path.open("r", encoding="utf-8") as fh:
             return json.load(fh)
     except Exception as e:
-        log.exception("Failed to load json %s: %s", path, e)
+        log.debug("Failed to load %s: %s", path, e)
         return None
 
-
-def _coalesce_float(v: Any, default: float = 0.0) -> float:
-    try:
-        if v is None:
-            return float(default)
-        return float(v)
-    except Exception:
-        return default
-
-
-# ----------------------------
-# Extraction logic (core)
-# ----------------------------
-
-
-def _normalize_interval(interval_raw: str) -> str:
+# ---------------- Extraction ----------------
+def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any]:
     """
-    Normalise interval token. Accept some variants.
+    Extract nested metrics; tolerate token-light snapshots.
     """
-    if not interval_raw:
-        return ""
-    t = str(interval_raw).lower()
-    # handle common forms
-    mapping = {
-        "1min": "1m",
-        "1m": "1m",
-        "5min": "5m",
-        "5m": "5m",
-        "15min": "15m",
-        "15m": "15m",
-        "1hour": "1h",
-        "1h": "1h",
-    }
-    for k, v in mapping.items():
-        if t.startswith(k):
-            return v
-    return t
-
-
-def _extract_core(parsed: Dict[str, Any], src_path: Optional[Path] = None) -> Dict[str, Any]:
-    """
-    Extract a compact core dictionary from a raw snapshot parsed JSON.
-    Pull nested data (OPEN_INTEREST, FUNDING_RATE, LIQUIDATIONS, NET_LONG_SHORT, HISTORY, TRADES).
-    """
-    # get top-level fields safely
-    symbol = parsed.get("SYMBOL") or parsed.get("symbol") or parsed.get("symbol_name")
-    interval_raw = parsed.get("INTERVAL") or parsed.get("interval") or parsed.get("tf") or ""
-    interval = _normalize_interval(interval_raw)
-    ts = parsed.get("ts") or parsed.get("TS") or parsed.get("timestamp") or parsed.get("time")
-    try:
-        ts = int(ts) if ts is not None else int(time.time())
-    except Exception:
-        ts = int(time.time())
+    symbol = _normalize_symbol(parsed.get("SYMBOL") or parsed.get("symbol") or parsed.get("symbol_name"))
+    interval = _normalize_interval(parsed.get("INTERVAL") or parsed.get("interval") or parsed.get("tf") or "")
+    ts = parsed.get("ts") or parsed.get("timestamp") or parsed.get("time")
+    try: ts = int(ts) if ts is not None else int(time.time())
+    except Exception: ts = int(time.time())
 
     # OPEN_INTEREST
-    oi_val = None
-    oi = parsed.get("OPEN_INTEREST") or parsed.get("open_interest") or {}
-    if isinstance(oi, dict):
-        # possible shapes: {"value": 12345.6, ...} or nested lists
-        oi_val = oi.get("value") or oi.get("oi") or oi.get("oi_value")
-    if oi_val is None:
-        # attempt to find `open_interest` inside arrays
-        try:
-            # some snapshots contain lists of objects in the "open_interest" key
-            if isinstance(oi, list) and len(oi) and isinstance(oi[0], dict):
-                oi_val = oi[0].get("value") or oi[0].get("oi")
-        except Exception:
-            oi_val = None
-    oi_delta = _coalesce_float(oi_val, 0.0)
+    oi_block = parsed.get("OPEN_INTEREST") or parsed.get("open_interest") or {}
+    oi_val = oi_block.get("value") if isinstance(oi_block, dict) else 0.0
 
     # FUNDING_RATE
+    fr_block = parsed.get("FUNDING_RATE") or parsed.get("funding_rate") or {}
     fr_val = None
-    fr = parsed.get("FUNDING_RATE") or parsed.get("funding_rate") or {}
-    if isinstance(fr, dict):
-        fr_val = fr.get("fr_value") or fr.get("value") or fr.get("funding")
-    fr_val = _coalesce_float(fr_val, 0.0)
+    if isinstance(fr_block, dict):
+        fr_val = fr_block.get("fr_value") or fr_block.get("value")
+    fr_val = _safe_float(fr_val, 0.0)
 
-    # NET_LONG_SHORT
-    nls_val = None
-    nls = parsed.get("NET_LONG_SHORT") or parsed.get("net_long_short")
-    if nls is None:
-        # sometimes stored as list of [ [ts, value], ... ]
-        nl = parsed.get("NET_LONG_SHORT_HISTORY") or parsed.get("net_long_short_history")
-        if isinstance(nl, list) and nl:
-            last = nl[-1]
-            # either pair [ts, val] or dict
-            if isinstance(last, (list, tuple)) and len(last) >= 2:
-                nls_val = last[1]
-            elif isinstance(last, dict):
-                nls_val = last.get("value") or last.get("v")
-    else:
-        nls_val = nls
-    nls_val = _coalesce_float(nls_val, 1.0)
+    # NET_LONG_SHORT (use last item if list of pairs)
+    nls_val = 1.0
+    nls_block = parsed.get("NET_LONG_SHORT") or parsed.get("net_long_short")
+    if isinstance(nls_block, list) and nls_block:
+        last = nls_block[-1]
+        if isinstance(last, (list, tuple)) and len(last) >= 2:
+            nls_val = _safe_float(last[1], 1.0)
+        elif isinstance(last, dict):
+            nls_val = _safe_float(last.get("value") or last.get("v"), 1.0)
+    elif isinstance(nls_block, (int, float, str)):
+        nls_val = _safe_float(nls_block, 1.0)
 
-    # LIQUIDATIONS
-    liq_long_total = 0.0
-    liq_short_total = 0.0
+    # LIQUIDATIONS: sum long(buy)/short(sell) notional
     liqs = parsed.get("LIQUIDATIONS") or parsed.get("liquidations") or []
-    # liqs often looks like: [{"t":ts,"b":123.4,"s":45.6}, ...] where b=buy (long), s=sell (short) OR vice versa
+    liq_long = 0.0; liq_short = 0.0
     if isinstance(liqs, list):
-        for item in liqs:
-            if not isinstance(item, dict):
-                continue
-            # common keys: "b", "s" or "buy", "sell", "long", "short"
-            b = item.get("b") or item.get("buy") or item.get("long") or 0.0
-            s = item.get("s") or item.get("sell") or item.get("short") or 0.0
-            try:
-                liq_long_total += float(b or 0.0)
-                liq_short_total += float(s or 0.0)
-            except Exception:
-                continue
+        for it in liqs:
+            if not isinstance(it, dict): continue
+            liq_long += _safe_float(it.get("b") or it.get("buy") or it.get("long"), 0.0)
+            liq_short+= _safe_float(it.get("s") or it.get("sell") or it.get("short"), 0.0)
 
-    # Try to extract CVD/trades deltas from trades or history (if present)
+    # CVD delta (optional): from last trade or sum last N deltas
     cvd_delta = None
-    cvd_history = parsed.get("TRADES") or parsed.get("trades") or parsed.get("HISTORY") or parsed.get("history")
-    if isinstance(cvd_history, list) and cvd_history:
-        # Search last few entries for 'cvd' or 'delta' keys and sum or take last.
-        # This is heuristic: prefer 'cvd' in last element; fallback to summing 'delta' entries.
-        last = cvd_history[-1]
+    trades = parsed.get("TRADES") or parsed.get("trades")
+    if isinstance(trades, list) and trades:
+        last = trades[-1]
         if isinstance(last, dict):
-            cvd_delta = last.get("cvd") or last.get("CVD") or last.get("cumulative_delta")
-        # fallback: sum 'delta' from a small selection
+            cvd_delta = last.get("cvd") or last.get("CVD")
         if cvd_delta is None:
             try:
-                s = 0.0
-                for it in cvd_history[-200:]:
-                    if isinstance(it, dict) and "delta" in it:
-                        s += float(it.get("delta", 0.0) or 0.0)
-                cvd_delta = s
+                cvd_delta = sum(_safe_float(it.get("delta"), 0.0) for it in trades[-200:] if isinstance(it, dict))
             except Exception:
                 cvd_delta = None
 
-    # Determine simple cvd_divergence (heuristic)
+    # Simple divergence heuristic
     cvd_div = "none"
-    if (liq_long_total or liq_short_total):
-        if liq_short_total > liq_long_total * 1.05:
-            cvd_div = "bullish"  # more short liquidations -> push price up
-        elif liq_long_total > liq_short_total * 1.05:
-            cvd_div = "bearish"
+    if liq_long or liq_short:
+        if liq_short > liq_long * 1.05: cvd_div = "bullish"
+        elif liq_long > liq_short * 1.05: cvd_div = "bearish"
 
-    # Also capture basic OHLC last value if available
-    ohlcv_snapshot = parsed.get("HISTORY") or parsed.get("history") or parsed.get("ohlc") or parsed.get("OHLC")
+    # Price from HISTORY (optional)
     last_price = None
-    if isinstance(ohlcv_snapshot, list) and ohlcv_snapshot:
-        last = ohlcv_snapshot[-1]
-        if isinstance(last, dict):
-            last_price = last.get("c") or last.get("close")
-    # Build core dict
-    core = {
+    hist = parsed.get("HISTORY") or parsed.get("history")
+    if isinstance(hist, list) and hist:
+        last = hist[-1]
+        if isinstance(last, dict): last_price = _safe_float(last.get("c") or last.get("close"), None)
+
+    return {
         "symbol": symbol,
         "interval": interval,
-        "ts": int(ts),
-        "oi_delta": _coalesce_float(oi_delta, 0.0),
-        "funding": _coalesce_float(fr_val, 0.0),
-        "net_long_short": _coalesce_float(nls_val, 1.0),
-        "liq_long": float(liq_long_total),
-        "liq_short": float(liq_short_total),
-        "cvd_delta": _coalesce_float(cvd_delta, 0.0) if cvd_delta is not None else None,
+        "ts": ts,
+        "oi_delta": _safe_float(oi_val, 0.0),
+        "funding": fr_val,
+        "net_long_short": _safe_float(nls_val, 1.0),
+        "liq_long": float(liq_long),
+        "liq_short": float(liq_short),
+        "cvd_delta": _safe_float(cvd_delta, 0.0) if cvd_delta is not None else None,
         "cvd_divergence": cvd_div,
-        "last_price": _coalesce_float(last_price, None) if last_price is not None else None,
-        "_file": str(src_path) if src_path is not None else None,
+        "last_price": last_price,
+        "_file": str(path) if path else None,
     }
-    return core
 
+def _has_metrics(parsed: Dict[str, Any]) -> bool:
+    """File is 'complete' if it has any of OI / FR / NLS / LIQUIDATIONS."""
+    if not isinstance(parsed, dict): return False
+    if isinstance(parsed.get("OPEN_INTEREST"), dict): return True
+    if isinstance(parsed.get("FUNDING_RATE"), dict): return True
+    if isinstance(parsed.get("NET_LONG_SHORT"), list): return True
+    if isinstance(parsed.get("LIQUIDATIONS"), list): return True
+    return False
 
-# ----------------------------
-# High-level scan helpers
-# ----------------------------
-
-
-def pick_latest_for_intervals(symbol_filter: Optional[str] = None, intervals: Optional[Iterable[str]] = None) -> Dict[str, Dict[str, Any]]:
+def _pick_latest_valid(symbol: Optional[str], tf: str) -> Dict[str, Any]:
     """
-    Return latest core for each interval for given symbol_filter.
-    Returns mapping interval -> core dict
+    Backtrack newest→older until we find a file for the (symbol, tf) that has metrics.
     """
-    result: Dict[str, Dict[str, Any]] = {}
-    intervals = set(intervals or ["1m", "5m", "15m", "1h"])
-    # Scan newest files first
-    for path in _rscan_latest(DATA_DIR, FILE_GLOB, limit=SCAN_LIMIT):
-        parsed = _safe_load_json(path)
-        if not parsed:
+    folder_map = {"1m":"1min","5m":"5min","15m":"15min","1h":"1hour"}
+    folder = folder_map.get(_normalize_interval(tf), tf)
+    pattern = f"**/{folder}/**/*.json"
+    for p in _rscan_latest(DATA_DIR, pattern, SCAN_LIMIT):
+        parsed = _load_json(p)
+        if not parsed: continue
+        core = _extract_core(parsed, p)
+        if symbol and core["symbol"] and core["symbol"] != _normalize_symbol(symbol):
             continue
-        core = _extract_core(parsed, path)
-        if not core.get("symbol"):
+        if _has_metrics(parsed):
+            return core
+    raise HTTPException(status_code=404, detail=f"No valid data for {symbol or '*'} {tf}")
+
+def _pick_all_intervals(symbol: str, tfs: Iterable[str]=("1m","5m","15m","1h")) -> Dict[str, Any]:
+    out = {}
+    for tf in tfs:
+        try:
+            out[tf] = _pick_latest_valid(symbol, tf)
+        except HTTPException:
             continue
-        if symbol_filter and str(core["symbol"]).lower() != str(symbol_filter).lower():
-            continue
-        interval = core.get("interval") or ""
-        if interval in intervals and interval not in result:
-            result[interval] = core
-            # if found all intervals, break early
-            if set(result.keys()) >= intervals:
-                break
-    return result
+    if not out: raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
+    return out
 
+# ---------------- Endpoints ----------------
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok" if Path(DATA_DIR).exists() else "missing_data_dir",
+            "dir": DATA_DIR, "glob": FILE_GLOB}
 
-# ----------------------------
-# API models (optional)
-# ----------------------------
+@app.get("/v1/files")
+def list_files(n: int = Query(50, ge=1, le=2000)):
+    key = f"files:{n}"
+    hit = _cache_get(key)
+    if hit: return hit
+    files = [str(p) for p in _rscan_latest(DATA_DIR, FILE_GLOB, n)]
+    payload = {"dir": DATA_DIR, "glob": FILE_GLOB, "count": len(files), "files": files}
+    _cache_set(key, payload)
+    return payload
 
+@app.get("/v1/metrics/{symbol}")
+def metrics_symbol(symbol: str):
+    symbol = _normalize_symbol(symbol)
+    key = f"metrics:{symbol}"
+    hit = _cache_get(key)
+    if hit: return hit
+    data = _pick_all_intervals(symbol)
+    payload = {"ok": True, "latest": data}
+    _cache_set(key, payload)
+    return payload
 
-class MetricsAllResponse(BaseModel):
-    ok: bool
-    latest: Dict[str, Dict[str, Any]]
-
-
-# ----------------------------
-# Endpoints
-# ----------------------------
-
-
-@app.get("/v1/metrics/all", response_model=MetricsAllResponse)
+@app.get("/v1/metrics/all")
 def metrics_all():
-    """
-    Return latest cores for all symbols / intervals found (limited).
-    Structure:
-      { "ok": True, "latest": { "BTCUSDT": { "1m": {...}, "5m": {...} }, "ETHUSDT": {...} } }
-    Implementation: scan files newest first and pick the first hit per symbol/interval.
-    """
-    # We'll build map: symbol -> interval -> core
-    latest_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    max_symbols = 200
+    key = "metrics:all"
+    hit = _cache_get(key)
+    if hit: return hit
+
+    # Build: symbol -> tf -> core (first valid per tf)
+    symbols_map: Dict[str, Dict[str, Any]] = {}
     scanned = 0
-
-    for path in _rscan_latest(DATA_DIR, FILE_GLOB, limit=SCAN_LIMIT):
-        parsed = _safe_load_json(path)
-        if not parsed:
+    for p in _rscan_latest(DATA_DIR, FILE_GLOB, SCAN_LIMIT):
+        parsed = _load_json(p)
+        if not parsed: continue
+        core = _extract_core(parsed, p)
+        sym = core["symbol"] or ""
+        tf  = core["interval"] or ""
+        if not sym or tf not in {"1m","5m","15m","1h"}:
             continue
-        core = _extract_core(parsed, path)
-        symbol = core.get("symbol")
-        interval = core.get("interval")
-        if not symbol or not interval:
+        if not _has_metrics(parsed):
             continue
-        if symbol not in latest_map:
-            latest_map[symbol] = {}
-        if interval not in latest_map[symbol]:
-            latest_map[symbol][interval] = core
-        # avoid scanning forever; stop if we've collected enough symbols
+        if sym not in symbols_map:
+            symbols_map[sym] = {}
+        if tf not in symbols_map[sym]:
+            symbols_map[sym][tf] = core
         scanned += 1
-        if len(latest_map) >= max_symbols:
-            break
-        # small safety break to keep response prompt
-        if scanned >= SCAN_LIMIT:
-            break
+        if scanned >= SCAN_LIMIT: break
 
-    return {"ok": True, "latest": latest_map}
+    payload = {"ok": True, "latest": symbols_map}
+    _cache_set(key, payload)
+    return payload
 
+@app.get("/v1/metrics/debug")
+def metrics_debug(symbol: Optional[str] = None, tf: Optional[str] = None):
+    """Return picked core for debugging (no cache)."""
+    try:
+        if symbol and tf:
+            core = _pick_latest_valid(symbol, tf)
+            return {"ok": True, "picked": core}
+        elif symbol:
+            return {"ok": True, "picked": _pick_all_intervals(symbol)}
+        else:
+            # no symbol: list recent files only
+            files = [str(p) for p in _rscan_latest(DATA_DIR, FILE_GLOB, 25)]
+            return {"ok": True, "files": files}
+    except HTTPException as e:
+        return JSONResponse({"detail": e.detail}, status_code=e.status_code)
 
-@app.get("/v1/metrics/{symbol}", response_model=MetricsAllResponse)
-def metrics_for_symbol(symbol: str):
-    """
-    Return the latest cores for requested symbol across the main intervals.
-    """
-    intervals = ["1m", "5m", "15m", "1h"]
-    picked = pick_latest_for_intervals(symbol_filter=symbol, intervals=intervals)
-    if not picked:
-        raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
-    return {"ok": True, "latest": picked}
-
-
-@app.get("/")
-def root():
-    return {"status": "ok", "dir": DATA_DIR, "glob": FILE_GLOB}
-
-
-# ----------------------------
-# Run with uvicorn if executed directly
-# ----------------------------
-if __name__ == "__main__":
-    import uvicorn
-
-    log.info("Starting CoinAnalyzer API server. DATA_DIR=%s FILE_GLOB=%s SCAN_LIMIT=%s", DATA_DIR, FILE_GLOB, SCAN_LIMIT)
-    uvicorn.run("coinalyze_api_server:app", host="0.0.0.0", port=8080, log_level="info", reload=False)
+log.info("CoinAnalyzer API up. DATA_DIR=%s FILE_GLOB=%s SCAN_LIMIT=%d", DATA_DIR, FILE_GLOB, SCAN_LIMIT)
