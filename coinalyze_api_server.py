@@ -1,5 +1,5 @@
 # coinalyze_api_server.py
-# Read-only FastAPI for CoinAnalyzer snapshots (nested extractor + symbol aliasing + route list)
+# Read-only FastAPI for CoinAnalyzer snapshots (path-based symbol detection + nested extractor)
 import os, time, json, glob, logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Iterable
@@ -22,7 +22,7 @@ logging.basicConfig(
 log = logging.getLogger("coinalyze_api")
 
 # ---------------- APP ----------------
-app = FastAPI(title="CoinAnalyzer API", version="1.4")
+app = FastAPI(title="CoinAnalyzer API", version="1.5")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 _cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -69,10 +69,26 @@ def _load_json(path: Path) -> Optional[Dict[str, Any]]:
         log.debug("Failed to load %s: %s", path, e)
         return None
 
+def _infer_raw_symbol_from_path(path: Path) -> str:
+    """
+    Walk the path segments and pick the first that looks like a symbol folder (e.g. BTCUSDT_PERP_A)
+    """
+    for seg in path.parts:
+        s = seg.upper()
+        if s.endswith("_PERP_A") or s.endswith("_SPOT") or s.endswith("_PERP"):
+            return s
+        # fallback: plain symbols like BTCUSDT
+        if len(s) >= 6 and s.isalnum() and s.endswith("USDT"):
+            return s
+    return ""
+
 # ---------------- Extraction ----------------
 def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any]:
     """Extract nested metrics; tolerate token-light snapshots. Keeps both raw and normalized symbols."""
     raw_symbol = (parsed.get("SYMBOL") or parsed.get("symbol") or parsed.get("symbol_name") or "").upper()
+    if not raw_symbol and path:
+        raw_symbol = _infer_raw_symbol_from_path(path)
+
     symbol = raw_symbol
     if symbol.endswith("_PERP_A"):
         symbol = symbol.replace("_PERP_A", "")
@@ -173,7 +189,9 @@ def _backtrack_latest_valid(tf: str, symbol_aliases: List[str]) -> Dict[str, Any
         parsed = _load_json(p)
         if not parsed: continue
         core = _extract_core(parsed, p)
-        if core["raw_symbol"] not in symbol_aliases and core["symbol"] not in symbol_aliases:
+        # accept if either JSON symbols match OR the path contains an alias (for token-light files)
+        if (core["raw_symbol"] not in symbol_aliases and core["symbol"] not in symbol_aliases
+            and not any(alias in str(p) for alias in symbol_aliases)):
             continue
         if _has_metrics(parsed):
             return core
