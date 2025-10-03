@@ -1,5 +1,5 @@
 # coinalyze_api_server.py
-# Read-only FastAPI for CoinAnalyzer snapshots (nested extractor + symbol aliasing)
+# Read-only FastAPI for CoinAnalyzer snapshots (nested extractor + symbol aliasing + route list)
 import os, time, json, glob, logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Iterable
@@ -15,12 +15,14 @@ SCAN_LIMIT    = int(os.getenv("SCAN_LIMIT", "1000"))
 CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "5"))
 LOGLEVEL      = os.getenv("LOGLEVEL", "INFO").upper()
 
-logging.basicConfig(level=getattr(logging, LOGLEVEL, logging.INFO),
-                    format="%(asctime)s %(levelname)s [coinalyze_api] %(message)s")
+logging.basicConfig(
+    level=getattr(logging, LOGLEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [coinalyze_api] %(message)s"
+)
 log = logging.getLogger("coinalyze_api")
 
 # ---------------- APP ----------------
-app = FastAPI(title="CoinAnalyzer API", version="1.3")
+app = FastAPI(title="CoinAnalyzer API", version="1.4")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 _cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -48,13 +50,10 @@ def _rscan_latest(base: str, pattern: str, limit: int) -> List[Path]:
     return [Path(p) for p in paths[:max(1, limit)]]
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
+    try: return float(v)
     except Exception:
-        try:
-            return float(str(v).replace(",", ""))
-        except Exception:
-            return default
+        try: return float(str(v).replace(",", ""))
+        except Exception: return default
 
 def _normalize_interval(tf_raw: Any) -> str:
     s = (str(tf_raw) if tf_raw is not None else "").lower()
@@ -114,7 +113,7 @@ def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any
             liq_long += _safe_float(it.get("b") or it.get("buy") or it.get("long"), 0.0)
             liq_short+= _safe_float(it.get("s") or it.get("sell") or it.get("short"), 0.0)
 
-    # Optional CVD delta from trades/history
+    # Optional CVD from trades/history
     cvd_delta = None
     trades = parsed.get("TRADES") or parsed.get("trades")
     if isinstance(trades, list) and trades:
@@ -207,8 +206,44 @@ def list_files(n: int = Query(50, ge=1, le=2000)):
     _cache_set(key, payload)
     return payload
 
+@app.get("/v1/metrics/all")
+def metrics_all():
+    """Return latest cores for all symbols and intervals (both raw+normalized keys)."""
+    key = "metrics:all"
+    hit = _cache_get(key)
+    if hit: return hit
+
+    sym_map: Dict[str, Dict[str, Any]] = {}
+    scanned = 0
+
+    for p in _rscan_latest(DATA_DIR, FILE_GLOB, SCAN_LIMIT):
+        parsed = _load_json(p)
+        if not parsed: continue
+        if not _has_metrics(parsed): continue
+        core = _extract_core(parsed, p)
+        tf  = core.get("interval")
+        if tf not in {"1m","5m","15m","1h"}: continue
+
+        raw = core["raw_symbol"] or ""
+        norm = core["symbol"] or raw
+
+        for key_sym in {raw, norm}:
+            if not key_sym: continue
+            if key_sym not in sym_map:
+                sym_map[key_sym] = {}
+            if tf not in sym_map[key_sym]:
+                sym_map[key_sym][tf] = core
+
+        scanned += 1
+        if scanned >= SCAN_LIMIT: break
+
+    payload = {"ok": True, "latest": sym_map}
+    _cache_set(key, payload)
+    return payload
+
 @app.get("/v1/metrics/{symbol}")
 def metrics_symbol(symbol: str):
+    """Return latest cores for a single symbol (normalized or raw)."""
     symbol = symbol.upper()
     aliases = [symbol, f"{symbol}_PERP_A"]
     key = f"metrics:{aliases}"
@@ -217,47 +252,6 @@ def metrics_symbol(symbol: str):
     data = _pick_all_intervals_for_aliases(aliases)
     payload = {"ok": True, "latest": data}
     _cache_set(key, payload)
-    return payload
-
-@app.get("/v1/metrics/all")
-def metrics_all():
-    key = "metrics:all"
-    hit = _cache_get(key)
-    if hit: return hit
-
-    # Build: symbols (normalized+raw) -> tf -> core
-    sym_map: Dict[str, Dict[str, Any]] = {}
-    scanned = 0
-
-    for p in _rscan_latest(DATA_DIR, FILE_GLOB, SCAN_LIMIT):
-        parsed = _load_json(p)
-        if not parsed: continue
-        # only keep files that actually have metrics
-        if not _has_metrics(parsed): 
-            continue
-        core = _extract_core(parsed, p)
-        tf  = core.get("interval")
-        if tf not in {"1m","5m","15m","1h"}: 
-            continue
-
-        raw = core["raw_symbol"] or ""
-        norm = core["symbol"] or raw
-
-        # Store under BOTH keys so callers can query either
-        for key_sym in {raw, norm}:
-            if not key_sym: 
-                continue
-            if key_sym not in sym_map:
-                sym_map[key_sym] = {}
-            if tf not in sym_map[key_sym]:
-                sym_map[key_sym][tf] = core
-
-        scanned += 1
-        if scanned >= SCAN_LIMIT:
-            break
-
-    payload = {"ok": True, "latest": sym_map}
-    _cache_set("metrics:all", payload)
     return payload
 
 @app.get("/v1/metrics/debug")
@@ -277,4 +271,9 @@ def metrics_debug(symbol: Optional[str] = None, tf: Optional[str] = None):
     except HTTPException as e:
         return JSONResponse({"detail": e.detail}, status_code=e.status_code)
 
-log.info("CoinAnalyzer API up. DATA_DIR=%s FILE_GLOB=%s SCAN_LIMIT=%d", DATA_DIR, FILE_GLOB, SCAN_LIMIT)
+# ------------- Print route list at startup (so you see it in Railway logs) -------------
+@app.on_event("startup")
+def _print_routes():
+    route_paths = sorted({getattr(r, 'path', '') for r in app.router.routes})
+    log.info("API up. DATA_DIR=%s FILE_GLOB=%s SCAN_LIMIT=%d", DATA_DIR, FILE_GLOB, SCAN_LIMIT)
+    log.info("Routes: %s", ", ".join(route_paths))
