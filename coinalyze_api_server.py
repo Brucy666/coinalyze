@@ -22,7 +22,7 @@ logging.basicConfig(
 log = logging.getLogger("coinalyze_api")
 
 # ---------------- APP ----------------
-app = FastAPI(title="CoinAnalyzer API", version="1.5")
+app = FastAPI(title="CoinAnalyzer API", version="1.6")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 _cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -86,7 +86,7 @@ def _infer_raw_symbol_from_path(path: Path) -> str:
 def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any]:
     """Extract nested metrics; tolerate token-light snapshots. Keeps both raw and normalized symbols."""
     raw_symbol = (parsed.get("SYMBOL") or parsed.get("symbol") or parsed.get("symbol_name") or "").upper()
-    if not raw_symbol and path:
+    if (not raw_symbol or raw_symbol == "") and path:
         raw_symbol = _infer_raw_symbol_from_path(path)
 
     symbol = raw_symbol
@@ -189,9 +189,10 @@ def _backtrack_latest_valid(tf: str, symbol_aliases: List[str]) -> Dict[str, Any
         parsed = _load_json(p)
         if not parsed: continue
         core = _extract_core(parsed, p)
-        # accept if either JSON symbols match OR the path contains an alias (for token-light files)
-        if (core["raw_symbol"] not in symbol_aliases and core["symbol"] not in symbol_aliases
-            and not any(alias in str(p) for alias in symbol_aliases)):
+        # accept JSON symbol match OR path contains alias (path-based fallback)
+        if (core["raw_symbol"] not in symbol_aliases
+            and core["symbol"] not in symbol_aliases
+            and not any(alias in str(p).upper() for alias in symbol_aliases)):
             continue
         if _has_metrics(parsed):
             return core
