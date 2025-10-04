@@ -1,6 +1,11 @@
 # coinalyze_api_server.py
 # Read-only FastAPI for CoinAnalyzer snapshots (path-based symbol detection + nested extractor)
-import os, time, json, glob, logging
+
+import os
+import time
+import json
+import glob
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 
@@ -22,14 +27,15 @@ logging.basicConfig(
 log = logging.getLogger("coinalyze_api")
 
 # ---------------- APP ----------------
-app = FastAPI(title="CoinAnalyzer API", version="1.6")
+app = FastAPI(title="CoinAnalyzer API", version="1.7")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 _cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 def _cache_get(k: str) -> Optional[Dict[str, Any]]:
     ent = _cache.get(k)
-    if not ent: return None
+    if not ent:
+        return None
     exp, payload = ent
     if time.time() > exp:
         _cache.pop(k, None)
@@ -50,15 +56,21 @@ def _rscan_latest(base: str, pattern: str, limit: int) -> List[Path]:
     return [Path(p) for p in paths[:max(1, limit)]]
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
-    try: return float(v)
+    try:
+        return float(v)
     except Exception:
-        try: return float(str(v).replace(",", ""))
-        except Exception: return default
+        try:
+            return float(str(v).replace(",", ""))
+        except Exception:
+            return default
 
 def _normalize_interval(tf_raw: Any) -> str:
     s = (str(tf_raw) if tf_raw is not None else "").lower()
     s = s.replace("mins", "m").replace("min", "m").replace("hour", "h")
-    mapping = {"1m":"1m","1":"1m","60s":"1m","5m":"5m","15m":"15m","1h":"1h","60":"1h","60m":"1h"}
+    mapping = {"1m":"1m", "1":"1m", "60s":"1m",
+               "5m":"5m",
+               "15m":"15m",
+               "1h":"1h", "60":"1h", "60m":"1h"}
     return mapping.get(s, s)
 
 def _load_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -70,14 +82,11 @@ def _load_json(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 def _infer_raw_symbol_from_path(path: Path) -> str:
-    """
-    Walk the path segments and pick the first that looks like a symbol folder (e.g. BTCUSDT_PERP_A)
-    """
+    """Infer symbol from a path segment like BTCUSDT_PERP_A or BTCUSDT."""
     for seg in path.parts:
         s = seg.upper()
-        if s.endswith("_PERP_A") or s.endswith("_SPOT") or s.endswith("_PERP"):
+        if s.endswith("_PERP_A") or s.endswith("_PERP") or s.endswith("_SPOT"):
             return s
-        # fallback: plain symbols like BTCUSDT
         if len(s) >= 6 and s.isalnum() and s.endswith("USDT"):
             return s
     return ""
@@ -95,8 +104,10 @@ def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any
 
     interval = _normalize_interval(parsed.get("INTERVAL") or parsed.get("interval") or parsed.get("tf") or "")
     ts = parsed.get("ts") or parsed.get("timestamp") or parsed.get("time")
-    try: ts = int(ts) if ts is not None else int(time.time())
-    except Exception: ts = int(time.time())
+    try:
+        ts = int(ts) if ts is not None else int(time.time())
+    except Exception:
+        ts = int(time.time())
 
     # OPEN_INTEREST
     oi_block = parsed.get("OPEN_INTEREST") or parsed.get("open_interest") or {}
@@ -122,12 +133,14 @@ def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any
 
     # LIQUIDATIONS: sum long(buy)/short(sell)
     liqs = parsed.get("LIQUIDATIONS") or parsed.get("liquidations") or []
-    liq_long = 0.0; liq_short = 0.0
+    liq_long = 0.0
+    liq_short = 0.0
     if isinstance(liqs, list):
         for it in liqs:
-            if not isinstance(it, dict): continue
+            if not isinstance(it, dict):
+                continue
             liq_long += _safe_float(it.get("b") or it.get("buy") or it.get("long"), 0.0)
-            liq_short+= _safe_float(it.get("s") or it.get("sell") or it.get("short"), 0.0)
+            liq_short += _safe_float(it.get("s") or it.get("sell") or it.get("short"), 0.0)
 
     # Optional CVD from trades/history
     cvd_delta = None
@@ -145,19 +158,22 @@ def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any
     # Divergence heuristic from liqs
     cvd_div = "none"
     if liq_long or liq_short:
-        if liq_short > liq_long * 1.05: cvd_div = "bullish"
-        elif liq_long > liq_short * 1.05: cvd_div = "bearish"
+        if liq_short > liq_long * 1.05:
+            cvd_div = "bullish"
+        elif liq_long > liq_short * 1.05:
+            cvd_div = "bearish"
 
     # Price (optional)
     last_price = None
     hist = parsed.get("HISTORY") or parsed.get("history")
     if isinstance(hist, list) and hist:
-        last = hist[-1]
-        if isinstance(last, dict): last_price = _safe_float(last.get("c") or last.get("close"), None)
+        hlast = hist[-1]
+        if isinstance(hlast, dict):
+            last_price = _safe_float(hlast.get("c") or hlast.get("close"), None)
 
     return {
-        "symbol": symbol,           # normalized e.g. BTCUSDT
-        "raw_symbol": raw_symbol,   # original e.g. BTCUSDT_PERP_A
+        "symbol": symbol,                 # normalized e.g. BTCUSDT
+        "raw_symbol": raw_symbol,         # original e.g. BTCUSDT_PERP_A
         "interval": interval,
         "ts": ts,
         "oi_delta": _safe_float(oi_val, 0.0),
@@ -173,33 +189,68 @@ def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any
 
 def _has_metrics(parsed: Dict[str, Any]) -> bool:
     """File is 'complete' if it has any of OI / FR / NLS / LIQUIDATIONS."""
-    if not isinstance(parsed, dict): return False
-    if isinstance(parsed.get("OPEN_INTEREST"), dict): return True
-    if isinstance(parsed.get("FUNDING_RATE"), dict): return True
-    if isinstance(parsed.get("NET_LONG_SHORT"), list): return True
-    if isinstance(parsed.get("LIQUIDATIONS"), list): return True
+    if not isinstance(parsed, dict):
+        return False
+    if isinstance(parsed.get("OPEN_INTEREST"), dict):
+        return True
+    if isinstance(parsed.get("FUNDING_RATE"), dict):
+        return True
+    if isinstance(parsed.get("NET_LONG_SHORT"), list):
+        return True
+    if isinstance(parsed.get("LIQUIDATIONS"), list):
+        return True
     return False
 
 def _backtrack_latest_valid(tf: str, symbol_aliases: List[str]) -> Dict[str, Any]:
-    """Backtrack newest→older under TF folder until we find a file for any alias that has metrics."""
-    folder_map = {"1m":"1min","5m":"5min","15m":"15min","1h":"1hour"}
-    folder = folder_map.get(_normalize_interval(tf), tf)
-    pattern = f"**/{folder}/**/*.json"
-    for p in _rscan_latest(DATA_DIR, pattern, SCAN_LIMIT):
+    """
+    Backtrack newest → older for the given timeframe and symbol aliases.
+
+    - Accepts BOTH raw and normalized symbols (e.g., BTCUSDT_PERP_A and BTCUSDT).
+    - Matches by *path* (folder names) as well as by JSON 'SYMBOL' field.
+    - Tolerates different TF folder spellings (1m/1min/60s, 5m/5min, 15m/15min, 1h/1hour/60m).
+    - Returns the first file that contains usable metrics (OI/FR/NLS/LIQS).
+    """
+    tf_norm = _normalize_interval(tf)
+    tf_aliases_map = {
+        "1m":  ["1m", "1min", "60s"],
+        "5m":  ["5m", "5min"],
+        "15m": ["15m", "15min"],
+        "1h":  ["1h", "1hour", "60m"],
+    }
+    tf_aliases = tf_aliases_map.get(tf_norm, [tf_norm])
+    alias_upper = [a.upper() for a in symbol_aliases]
+
+    # Collect candidate files by PATH (fast and robust)
+    candidates: List[Path] = []
+    for p in _rscan_latest(DATA_DIR, FILE_GLOB, SCAN_LIMIT * 2):
+        upath = str(p).upper()
+        if any(a in upath for a in alias_upper) and any(tfa in upath for tfa in tf_aliases):
+            candidates.append(Path(p))
+
+    if not candidates:
+        raise HTTPException(status_code=404, detail=f"No files matched {symbol_aliases} {tf}")
+
+    # Try candidates newest → older until we find valid metrics
+    for p in candidates:
         parsed = _load_json(p)
-        if not parsed: continue
+        if not parsed:
+            continue
         core = _extract_core(parsed, p)
-        # accept JSON symbol match OR path contains alias (path-based fallback)
+
+        # Accept if JSON symbol match OR path contains alias (path fallback)
         if (core["raw_symbol"] not in symbol_aliases
             and core["symbol"] not in symbol_aliases
-            and not any(alias in str(p).upper() for alias in symbol_aliases)):
+            and not any(a in str(p).upper() for a in alias_upper)):
             continue
+
         if _has_metrics(parsed):
+            log.info("[backtrack] valid %s %s -> %s", symbol_aliases, tf, p)
             return core
+
     raise HTTPException(status_code=404, detail=f"No valid data for {symbol_aliases} {tf}")
 
-def _pick_all_intervals_for_aliases(symbol_aliases: List[str], tfs: Iterable[str]=("1m","5m","15m","1h")) -> Dict[str, Any]:
-    out = {}
+def _pick_all_intervals_for_aliases(symbol_aliases: List[str], tfs: Iterable[str]=("1m", "5m", "15m", "1h")) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
     for tf in tfs:
         try:
             out[tf] = _backtrack_latest_valid(tf, symbol_aliases)
@@ -219,7 +270,8 @@ def healthz():
 def list_files(n: int = Query(50, ge=1, le=2000)):
     key = f"files:{n}"
     hit = _cache_get(key)
-    if hit: return hit
+    if hit:
+        return hit
     files = [str(p) for p in _rscan_latest(DATA_DIR, FILE_GLOB, n)]
     payload = {"dir": DATA_DIR, "glob": FILE_GLOB, "count": len(files), "files": files}
     _cache_set(key, payload)
@@ -230,31 +282,33 @@ def metrics_all():
     """Return latest cores for all symbols and intervals (both raw+normalized keys)."""
     key = "metrics:all"
     hit = _cache_get(key)
-    if hit: return hit
+    if hit:
+        return hit
 
     sym_map: Dict[str, Dict[str, Any]] = {}
     scanned = 0
 
     for p in _rscan_latest(DATA_DIR, FILE_GLOB, SCAN_LIMIT):
         parsed = _load_json(p)
-        if not parsed: continue
-        if not _has_metrics(parsed): continue
+        if not parsed or not _has_metrics(parsed):
+            continue
         core = _extract_core(parsed, p)
         tf  = core.get("interval")
-        if tf not in {"1m","5m","15m","1h"}: continue
+        if tf not in {"1m", "5m", "15m", "1h"}:
+            continue
 
         raw = core["raw_symbol"] or ""
         norm = core["symbol"] or raw
 
         for key_sym in {raw, norm}:
-            if not key_sym: continue
-            if key_sym not in sym_map:
-                sym_map[key_sym] = {}
-            if tf not in sym_map[key_sym]:
-                sym_map[key_sym][tf] = core
+            if not key_sym:
+                continue
+            sym_map.setdefault(key_sym, {})
+            sym_map[key_sym].setdefault(tf, core)
 
         scanned += 1
-        if scanned >= SCAN_LIMIT: break
+        if scanned >= SCAN_LIMIT:
+            break
 
     payload = {"ok": True, "latest": sym_map}
     _cache_set(key, payload)
@@ -267,7 +321,8 @@ def metrics_symbol(symbol: str):
     aliases = [symbol, f"{symbol}_PERP_A"]
     key = f"metrics:{aliases}"
     hit = _cache_get(key)
-    if hit: return hit
+    if hit:
+        return hit
     data = _pick_all_intervals_for_aliases(aliases)
     payload = {"ok": True, "latest": data}
     _cache_set(key, payload)
