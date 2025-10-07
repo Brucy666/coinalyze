@@ -1,5 +1,18 @@
 # coinalyze_api_server.py
-# Read-only FastAPI for CoinAnalyzer snapshots (path-based symbol detection + nested extractor)
+# Read-only FastAPI for CoinAnalyzer snapshots
+# - Recursively scans DATA_DIR for *.json
+# - Infers symbol from path when JSON lacks it (e.g., BTCUSDT_PERP_A -> BTCUSDT)
+# - Extracts nested metrics (OPEN_INTEREST.value, FUNDING_RATE.fr_value,
+#   latest NET_LONG_SHORT, LIQUIDATIONS sums; optional CVD from TRADES/HISTORY)
+# - Backtracks newest→older per timeframe until a file with metrics is found
+# - Endpoints: /healthz, /v1/files, /v1/metrics/all, /v1/metrics/{symbol}, /v1/metrics/debug
+#
+# ENV (defaults):
+#   DATA_DIR=/data
+#   FILE_GLOB=**/*.json
+#   SCAN_LIMIT=1000
+#   CACHE_TTL_SEC=5
+#   LOGLEVEL=INFO
 
 import os
 import time
@@ -27,7 +40,7 @@ logging.basicConfig(
 log = logging.getLogger("coinalyze_api")
 
 # ---------------- APP ----------------
-app = FastAPI(title="CoinAnalyzer API", version="1.7")
+app = FastAPI(title="CoinAnalyzer API", version="1.8")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 _cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -92,8 +105,17 @@ def _infer_raw_symbol_from_path(path: Path) -> str:
     return ""
 
 # ---------------- Extraction ----------------
+def _unwrap_body(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the dict that actually contains metrics: top-level or under DATA/SNAPSHOT/PAYLOAD."""
+    if not isinstance(parsed, dict):
+        return {}
+    for key in ("DATA", "SNAPSHOT", "PAYLOAD"):
+        if isinstance(parsed.get(key), dict):
+            return parsed[key]
+    return parsed
+
 def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any]:
-    """Extract nested metrics; tolerate token-light snapshots. Keeps both raw and normalized symbols."""
+    """Extract nested metrics; tolerant of token-light snapshots. Keeps both raw and normalized symbols."""
     raw_symbol = (parsed.get("SYMBOL") or parsed.get("symbol") or parsed.get("symbol_name") or "").upper()
     if (not raw_symbol or raw_symbol == "") and path:
         raw_symbol = _infer_raw_symbol_from_path(path)
@@ -109,19 +131,21 @@ def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any
     except Exception:
         ts = int(time.time())
 
+    body = _unwrap_body(parsed)
+
     # OPEN_INTEREST
-    oi_block = parsed.get("OPEN_INTEREST") or parsed.get("open_interest") or {}
-    oi_val = oi_block.get("value") if isinstance(oi_block, dict) else 0.0
+    oi_block = body.get("OPEN_INTEREST") or body.get("open_interest") or {}
+    oi_val = _safe_float(oi_block.get("value"), 0.0) if isinstance(oi_block, dict) else 0.0
 
     # FUNDING_RATE
-    fr_block = parsed.get("FUNDING_RATE") or parsed.get("funding_rate") or {}
+    fr_block = body.get("FUNDING_RATE") or body.get("funding_rate") or {}
     fr_val = 0.0
     if isinstance(fr_block, dict):
         fr_val = _safe_float(fr_block.get("fr_value") or fr_block.get("value"), 0.0)
 
-    # NET_LONG_SHORT (use last item if list of pairs)
+    # NET_LONG_SHORT (list of [ts, value] or dict with value)
     nls_val = 1.0
-    nls_block = parsed.get("NET_LONG_SHORT") or parsed.get("net_long_short")
+    nls_block = body.get("NET_LONG_SHORT") or body.get("net_long_short")
     if isinstance(nls_block, list) and nls_block:
         last = nls_block[-1]
         if isinstance(last, (list, tuple)) and len(last) >= 2:
@@ -132,7 +156,7 @@ def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any
         nls_val = _safe_float(nls_block, 1.0)
 
     # LIQUIDATIONS: sum long(buy)/short(sell)
-    liqs = parsed.get("LIQUIDATIONS") or parsed.get("liquidations") or []
+    liqs = body.get("LIQUIDATIONS") or body.get("liquidations") or []
     liq_long = 0.0
     liq_short = 0.0
     if isinstance(liqs, list):
@@ -144,16 +168,12 @@ def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any
 
     # Optional CVD from trades/history
     cvd_delta = None
-    trades = parsed.get("TRADES") or parsed.get("trades")
+    trades = body.get("TRADES") or body.get("trades")
     if isinstance(trades, list) and trades:
-        last = trades[-1]
-        if isinstance(last, dict):
-            cvd_delta = last.get("cvd") or last.get("CVD")
-        if cvd_delta is None:
-            try:
-                cvd_delta = sum(_safe_float(it.get("delta"), 0.0) for it in trades[-200:] if isinstance(it, dict))
-            except Exception:
-                cvd_delta = None
+        try:
+            cvd_delta = sum(_safe_float(t.get("delta"), 0.0) for t in trades if isinstance(t, dict))
+        except Exception:
+            cvd_delta = None
 
     # Divergence heuristic from liqs
     cvd_div = "none"
@@ -163,44 +183,29 @@ def _extract_core(parsed: Dict[str, Any], path: Optional[Path]) -> Dict[str, Any
         elif liq_long > liq_short * 1.05:
             cvd_div = "bearish"
 
-    # Price (optional)
-    last_price = None
-    hist = parsed.get("HISTORY") or parsed.get("history")
-    if isinstance(hist, list) and hist:
-        hlast = hist[-1]
-        if isinstance(hlast, dict):
-            last_price = _safe_float(hlast.get("c") or hlast.get("close"), None)
-
     return {
         "symbol": symbol,                 # normalized e.g. BTCUSDT
         "raw_symbol": raw_symbol,         # original e.g. BTCUSDT_PERP_A
         "interval": interval,
-        "ts": ts,
-        "oi_delta": _safe_float(oi_val, 0.0),
-        "funding": _safe_float(fr_val, 0.0),
-        "net_long_short": _safe_float(nls_val, 1.0),
+        "ts": int(ts),
+        "oi_delta": oi_val,
+        "funding": fr_val,
+        "net_long_short": nls_val,
         "liq_long": float(liq_long),
         "liq_short": float(liq_short),
         "cvd_delta": _safe_float(cvd_delta, 0.0) if cvd_delta is not None else None,
         "cvd_divergence": cvd_div,
-        "last_price": last_price,
         "_file": str(path) if path else None,
     }
 
 def _has_metrics(parsed: Dict[str, Any]) -> bool:
-    """File is 'complete' if it has any of OI / FR / NLS / LIQUIDATIONS."""
+    """Return True if metrics exist at top or under DATA/SNAPSHOT/PAYLOAD."""
     if not isinstance(parsed, dict):
         return False
-    if isinstance(parsed.get("OPEN_INTEREST"), dict):
-        return True
-    if isinstance(parsed.get("FUNDING_RATE"), dict):
-        return True
-    if isinstance(parsed.get("NET_LONG_SHORT"), list):
-        return True
-    if isinstance(parsed.get("LIQUIDATIONS"), list):
-        return True
-    return False
+    body = _unwrap_body(parsed)
+    return any(k in body for k in ("OPEN_INTEREST", "FUNDING_RATE", "NET_LONG_SHORT", "LIQUIDATIONS"))
 
+# ---------------- Backtracker ----------------
 def _backtrack_latest_valid(tf: str, symbol_aliases: List[str]) -> Dict[str, Any]:
     """
     Backtrack newest → older for the given timeframe and symbol aliases.
