@@ -8,6 +8,7 @@ from coinalyze_api import (
 )
 from data_sink import write_snapshot, append_jsonl, retention_cleanup
 from discord_poster import post_summary, build_embed
+import requests  # NEW
 
 # ---------------- Env / Config ----------------
 SYMBOL       = os.getenv("SYMBOL", "").strip()
@@ -18,6 +19,9 @@ ROTATE_TF    = os.getenv("ROTATE_INTERVALS", "true").lower() == "true"
 WINDOW_HR    = int(os.getenv("WINDOW_HOURS", "6"))
 SLEEP_SEC    = int(os.getenv("SLEEP_SECONDS", "60"))
 PRINT_JSON   = os.getenv("PRINT_JSON", "false").lower() == "true"
+
+API_URL = os.getenv("API_URL", "https://coinalyze-api-production.up.railway.app").rstrip("/")  # NEW
+INGEST_TOKEN = os.getenv("INGEST_TOKEN", "")  # NEW
 
 def sleep_with_jitter(sec: int):  # small jitter to avoid thundering herd
     time.sleep(sec + random.uniform(0, 0.3*sec))
@@ -101,6 +105,32 @@ def auto_pick_symbol():
         return any_btc[0]["symbol"]
     raise RuntimeError(f"No perp market found for {BASE_ASSET} (exchange hint='{EXCHANGE}')")
 
+# -------- NEW: API push helper --------
+def push_snapshot_to_api(payload: dict):
+    """
+    POST the snapshot to the Coinalyze API /v1/ingest.
+    Safe to fail: logs and returns, never crashes the loop.
+    """
+    if not API_URL or not INGEST_TOKEN:
+        return
+    try:
+        r = requests.post(
+            f"{API_URL}/v1/ingest",
+            headers={"X-Auth-Token": INGEST_TOKEN, "Content-Type": "application/json"},
+            data=json.dumps(payload),
+            timeout=10,
+        )
+        if r.status_code >= 300:
+            print(f"[push] ingest failed {r.status_code}: {r.text[:200]}")
+        else:
+            try:
+                j = r.json()
+                print(f"[push] ok -> {j.get('file','(ok)')}")
+            except Exception:
+                print("[push] ok (no JSON body)")
+    except Exception as e:
+        print(f"[push] error: {repr(e)}")
+
 # ---------------- Fetch (per interval) ----------------
 def fetch_block_for_interval(symbol: str, interval: str):
     t1 = now_ts(); t0 = t1 - WINDOW_HR*3600
@@ -154,6 +184,9 @@ def main_loop():
             # persist
             snapshot_path = write_snapshot(symbol, interval, pack)
             _ = append_jsonl(symbol, interval, pack)
+
+            # NEW: push to API
+            push_snapshot_to_api(pack)
 
             # terminal summary
             oi_val = pack["snapshots"].get("oi_value")
